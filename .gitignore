@@ -1,0 +1,22 @@
+# 编译产物 / 中间件：源码仓库只收 .py，.so/.c 由打包流程在构建阶段生成
+*.so
+*.pyd
+*.c
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+
+# 交付物 / 证据目录（打包/验收产生，不入库）
+*.tar
+evidence/
+experiments/
+
+# 密钥与本地环境
+.env
+*.pem
+*.key
+
+# 系统杂物
+.DS_Store
