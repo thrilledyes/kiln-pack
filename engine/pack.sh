@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # kiln-pack 通用打包脚本：读一份 pack.conf，产出“看不到源码、能起服、能查版本、能做验收”的镜像。
 # 用法: pack.sh <项目目录，含 pack.conf> [额外 docker build 参数...]
 #

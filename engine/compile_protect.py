@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: Apache-2.0
 """把受保护的 .py 编译成原生扩展模块（.so），删除对应明文源码。
 
 在镜像的构建阶段执行，不进入最终运行镜像。

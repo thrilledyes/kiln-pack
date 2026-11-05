@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
 # kiln-pack 验收：确认镜像“源码看不见 + 服务正常 + 可运维”三件事同时成立。
 # 用法: verify.sh <项目目录>
 # 本脚本只认 pack.conf，不含任何具体项目/demo 的硬编码——受保护文件、来源痕迹

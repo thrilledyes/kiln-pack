@@ -44,3 +44,8 @@ bash engine/pack.sh tests/demo-fastapi
   敏感常量应走环境变量外置（`pack.conf` 的 `REQUIRED_ENV`）。
 - `.so` 认平台和 Python 版本：builder 与 runtime 的架构、Python 版本必须一致。
 - 这是**抬高抄袭门槛**，不是绝对加密。要「逻辑绝对不可得」只能把算法留在自己服务器、对外只给 API。
+
+## 许可证
+
+Apache License 2.0，见 [LICENSE](LICENSE)。可自由用于商业与闭源项目，修改需保留版权与变更说明；
+如需专利授权与商标保护，本许可证已覆盖。

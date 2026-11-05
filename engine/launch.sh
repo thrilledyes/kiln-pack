@@ -1,4 +1,5 @@
 #!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
 # 统一启动入口。真正的起服命令写死在镜像里（build 时注入），
 # 这样 docker run 不需要带命令，运维侧只管 up/down/日志。
 set -eu
