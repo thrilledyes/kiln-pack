@@ -61,7 +61,7 @@ echo
 BUILD_CTX="$(mktemp -d)"
 trap 'rm -rf "$BUILD_CTX"' EXIT
 
-echo "-- 1/5 复制构建上下文（排除 .git / 证据目录 / 预编译产物）"
+echo "-- 1/3 复制构建上下文（排除 .git / 证据目录 / 预编译产物）"
 # 排除源码树里的预编译产物（.so/.pyd/.pyc）：它们应在 builder 阶段由 .py 重新编译。
 # 源树里的旧 .so 会被原样带进镜像，可能残留已从 .py 删除的旧密钥（这个坑踩过，见教程）。
 rsync -a \
@@ -83,8 +83,10 @@ cp "${SCRIPT_DIR}/healthcheck.sh" "${BUILD_CTX}/.kiln/healthcheck.sh"
 printf '%s\n' "$START_CMD" > "${BUILD_CTX}/.kiln/start_cmd.sh"
 printf '%s\n' "$HEALTHCHECK_CMD" > "${BUILD_CTX}/.kiln/health_cmd.sh"
 # 运行必需的 env 清单（每行一个），launch.sh 起服前据此校验，缺失即拒绝启动
+set -f  # 关文件名通配，避免 env 名含特殊字符时被 glob 展开
 printf '%s\n' ${REQUIRED_ENV:-} > "${BUILD_CTX}/.kiln/required_env.list"
-chmod +x "${BUILD_CTX}/.kiln/"*.sh "${BUILD_CTX}/.kiln/launch.sh"
+set +f
+chmod +x "${BUILD_CTX}/.kiln/"*.sh
 
 # healthcheck.sh 是 HEALTHCHECK 的入口（Dockerfile 里 CMD 指向它），
 # 它只负责 exec 上面渲染自 pack.conf HEALTHCHECK_CMD 的 health_cmd.sh。

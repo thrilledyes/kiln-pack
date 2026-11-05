@@ -46,7 +46,8 @@ ENV PYTHONUNBUFFERED=1 \
     KILN_APP=${KILN_APP} \
     KILN_VERSION=${KILN_VERSION} \
     KILN_BUILD_ID=${KILN_BUILD_ID} \
-    KILN_BUILT_AT=${KILN_BUILT_AT}
+    KILN_BUILT_AT=${KILN_BUILT_AT} \
+    HOME=/home/appuser
 WORKDIR /app
 # 拷贝已去源码的应用树（含 .so、.kiln 脚本，不含受保护 .py）
 COPY --from=builder /src /app
@@ -63,7 +64,7 @@ RUN set -eux; \
 # 注：需要写缓存目录或访问设备（如 GPU）的框架，后续用 pack.conf 开关放宽。
 # 构建上下文（mktemp -d 0700 + rsync）目录权限不含 others 位，
 # 切非 root 前先给 /app 放开只读访问（a+rX：只加读和目录执行位，不给写）。
-RUN useradd -r -u 10001 -s /usr/sbin/nologin appuser \
+RUN useradd -u 10001 -m -d /home/appuser -s /usr/sbin/nologin appuser \
  && chmod -R a+rX /app
 USER appuser
 LABEL kiln.app="${KILN_APP}" \

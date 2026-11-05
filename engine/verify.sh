@@ -26,12 +26,22 @@ echo "== 1. 镜像里的文件 =="
 LISTING="$(docker run --rm --entrypoint /bin/sh "$TAG" -c 'find /app -type f | sort')"
 echo "$LISTING" | sed 's/^/    /'
 
-echo "== 2. 受保护的 .py 不在镜像里 =="
-for g in $PROTECT_GLOBS; do
-  base="${g%.py}"
-  if echo "$LISTING" | grep -qx "/app/${base}.py"; then bad "明文仍在: /app/${base}.py"; else ok "无明文: ${base}.py"; fi
-  if echo "$LISTING" | grep -q "^/app/${base}\..*\.so$"; then ok "有编译产物: ${base}*.so"; else bad "缺编译产物: ${base}*.so"; fi
-done
+echo "== 2. 受保护的 .py 不在镜像里（清单取自打包阶段写入的 .kiln/protected.list）=="
+# 不再在验收端自行解释 PROTECT_GLOBS：改用 compile_protect.py 实际编译后记录的
+# 受保护清单，两边口径一致，支持任意 glob / 子目录。
+PROT_LIST="$(docker run --rm --entrypoint /bin/sh "$TAG" -c 'cat /app/.kiln/protected.list 2>/dev/null')"
+if [ -z "$PROT_LIST" ]; then
+  bad "镜像里没有 /app/.kiln/protected.list（请用新版引擎重新打包）"
+else
+  while IFS= read -r rel; do
+    [ -z "$rel" ] && continue
+    base="${rel%.py}"
+    if echo "$LISTING" | grep -qx "/app/${rel}"; then bad "明文仍在: /app/${rel}"; else ok "无明文: ${rel}"; fi
+    if echo "$LISTING" | grep -qE "^/app/${base}\..*\.so$"; then ok "有编译产物: ${base}*.so"; else bad "缺编译产物: ${base}*.so"; fi
+  done <<KILN_PROT_EOF
+$PROT_LIST
+KILN_PROT_EOF
+fi
 if echo "$LISTING" | grep -qE '\.(c|pyx)$'; then bad "镜像里有 .c/.pyx 中间产物"; else ok "无 .c/.pyx 中间产物"; fi
 if echo "$LISTING" | grep -q 'pack.conf'; then bad "镜像里有 pack.conf"; else ok "无 pack.conf"; fi
 
@@ -74,8 +84,8 @@ echo "== 6. 运维入口 =="
 docker logs "$CNAME" 2>&1 | tail -3 | sed 's/^/    log: /'
 sleep 1
 ST="$(docker inspect -f '{{.State.Health.Status}}' "$CNAME" 2>/dev/null || echo none)"; echo "    health: $ST"
-# 取 PROTECT_GLOBS 的第一个受保护文件做“容器内 cat 不到明文”探针——不写死具体文件名。
-FIRST_PROT="$(echo $PROTECT_GLOBS | awk '{print $1}')"
+# 取受保护清单的第一个文件做“容器内 cat 不到明文”探针——清单即实际编译结果。
+FIRST_PROT="$(echo "$PROT_LIST" | head -n1)"
 if [ -n "$FIRST_PROT" ]; then
   if docker exec "$CNAME" /bin/sh -c "cat /app/${FIRST_PROT}" >/dev/null 2>&1; then
     bad "容器内 cat 到了源码: /app/${FIRST_PROT}"

@@ -49,7 +49,7 @@ def main():
     # 逐个编译成 .so。--no-docstrings 连文档字符串一起去掉，减少可读信息。
     for f in targets:
         run([sys.executable, "-m", "Cython.Build.Cythonize",
-             "-3", "-i", "-q", "--no-docstrings", f])
+             "-3", "-i", "-q", "--no-docstrings", "-X", "binding=True", f])
 
     # strip 符号表（失败不致命，老镜像可能没有 strip）
     for dirpath, _dirs, files in os.walk(root):
@@ -75,6 +75,16 @@ def main():
     if os.path.isdir(build_dir):
         shutil.rmtree(build_dir, ignore_errors=True)
         print("已清理中间目录:", os.path.relpath(build_dir, root))
+
+    # 记录被保护文件清单（相对 root），供 verify.sh 精确核对，
+    # 避免验收端再自行解释 glob，与实际编译结果保持一致。
+    kiln_dir = os.path.join(root, ".kiln")
+    if os.path.isdir(kiln_dir):
+        rels = [os.path.relpath(t, root) for t in targets]
+        with open(os.path.join(kiln_dir, "protected.list"), "w") as fh:
+            for rel in rels:
+                fh.write(rel + os.linesep)
+        print("已记录受保护清单:", os.path.join(".kiln", "protected.list"))
 
     print("编译完成，产物:")
     for dirpath, _dirs, files in os.walk(root):
