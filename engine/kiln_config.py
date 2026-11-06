@@ -10,18 +10,25 @@
 CONFIG_ENCRYPT=off 时镜像里是明文文件，同样的调用照常工作，项目代码不用改。
 别在模块顶层读配置：builder 阶段的 import 自检拿不到密钥。
 
+框架只接受配置文件路径时，launch.sh 用 materialize 把配置解密到内存盘（见 CONFIG_MATERIALIZE）。
+
 密文格式：MAGIC(8) + nonce(12) + AES-256-GCM 密文和标签。
 相对路径作为附加认证数据，把一份密文改名冒充另一份配置会解密失败。
 """
 import base64
 import binascii
 import os
+import shutil
+import sys
+import tempfile
 
 MAGIC = b"KILNCFG1"
 NONCE_LEN = 12
 KEY_LEN = 32
 KEY_ENV = "KILN_CONFIG_KEY"
 ENC_SUFFIX = ".enc"
+# /dev/shm 只作为 mkdtemp 的父目录：下面创建 0700 私有子目录、0600 文件，并强制校验 tmpfs。
+SHM_DIR = "/dev/shm"  # NOSONAR(S5443)
 
 
 class KilnConfigError(RuntimeError):
@@ -110,3 +117,59 @@ def load_yaml(rel, root=None):
         mark = getattr(exc, "problem_mark", None)
         where = f"第 {mark.line + 1} 行第 {mark.column + 1} 列" if mark else "位置未知"
         raise KilnConfigError(f"配置不是合法的 YAML（{where}）: {rel}") from None
+
+
+def _mount_fstype(path, mounts_file="/proc/mounts"):
+    """返回 path 所在挂载点的文件系统类型，查不到时返回 None。"""
+    path = os.path.realpath(path)
+    best, fstype = "", None
+    with open(mounts_file, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            fields = line.split()
+            if len(fields) < 3:
+                continue
+            mount = fields[1].replace("\\040", " ")
+            inside = path == mount or path.startswith(mount.rstrip("/") + "/")
+            if inside and len(mount) >= len(best):
+                best, fstype = mount, fields[2]
+    return fstype
+
+
+def materialize(rels, root=None, base_dir=SHM_DIR):
+    """把配置解密成文件放到内存盘，返回目录。文件按原相对路径摆放。
+
+    只写 tmpfs，明文绝不落到磁盘；目录 0700、文件 0600，只有当前用户读得到。
+    """
+    fstype = _mount_fstype(base_dir)
+    if fstype != "tmpfs":
+        raise KilnConfigError(f"{base_dir} 不是内存盘（{fstype}），拒绝把配置明文写上去")
+    out_dir = tempfile.mkdtemp(prefix="kiln-config-", dir=base_dir)
+    try:
+        for rel in rels:
+            rel = normalize_rel(rel)
+            data = load(rel, root)
+            path = os.path.join(out_dir, rel)
+            os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+    except BaseException:
+        shutil.rmtree(out_dir, ignore_errors=True)
+        raise
+    return out_dir
+
+
+def _main(argv):
+    if len(argv) < 2 or argv[0] != "materialize":
+        print("用法: python -m kiln_config materialize <相对路径>...", file=sys.stderr)
+        return 2
+    try:
+        print(materialize(argv[1:]))
+    except (KilnConfigError, OSError) as exc:
+        print(f"[kiln] 解密配置失败: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

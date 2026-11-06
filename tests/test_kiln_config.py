@@ -141,5 +141,60 @@ class Rejects(Base):
         self.assertFalse(os.path.exists(os.path.join(self.out, REL + kiln_config.ENC_SUFFIX)))
 
 
+class Materialize(Base):
+    def setUp(self):
+        super().setUp()
+        self.base = os.path.join(os.path.dirname(self.src), "shm")
+        os.makedirs(self.base)
+        # 测试环境不一定有内存盘，这里只替换挂载类型判断；拒绝非内存盘单独测。
+        patch = mock.patch.object(kiln_config, "_mount_fstype", return_value="tmpfs")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def test_writes_plaintext_with_private_permissions(self):
+        self.encrypt()
+        out = kiln_config.materialize([REL], self.out, self.base)
+        path = os.path.join(out, REL)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), PLAIN)
+        self.assertEqual(os.stat(out).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+
+    def test_refuses_non_tmpfs(self):
+        self.encrypt()
+        kiln_config._mount_fstype.return_value = "ext4"
+        with self.assertRaises(kiln_config.KilnConfigError) as cm:
+            kiln_config.materialize([REL], self.out, self.base)
+        self.assertIn("不是内存盘", str(cm.exception))
+        self.assertEqual(os.listdir(self.base), [])
+
+    def test_failure_leaves_nothing_behind(self):
+        self.encrypt()
+        with self.assertRaises(kiln_config.KilnConfigError):
+            kiln_config.materialize([REL, "configs/missing.yaml"], self.out, self.base)
+        self.assertEqual(os.listdir(self.base), [])
+
+    def test_wrong_key_leaves_nothing_behind(self):
+        self.encrypt()
+        self.env(new_key_text())
+        with self.assertRaises(kiln_config.KilnConfigError):
+            kiln_config.materialize([REL], self.out, self.base)
+        self.assertEqual(os.listdir(self.base), [])
+
+
+class MountType(unittest.TestCase):
+    def fstype(self, path, mounts):
+        with tempfile.NamedTemporaryFile("w", suffix=".mounts") as f:
+            f.write(mounts)
+            f.flush()
+            return kiln_config._mount_fstype(path, f.name)
+
+    def test_longest_mount_wins(self):
+        mounts = "overlay / overlay rw 0 0\nshm /dev/shm tmpfs rw 0 0\n"
+        self.assertEqual(self.fstype("/dev/shm", mounts), "tmpfs")
+        self.assertEqual(self.fstype("/dev/shm/x", mounts), "tmpfs")
+        self.assertEqual(self.fstype("/dev/shmfake", mounts), "overlay")
+
+
 if __name__ == "__main__":
     unittest.main()

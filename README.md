@@ -45,8 +45,9 @@ bash engine/pack.sh tests/demo-train
 - **只保护真正的 IP 模块**：模型结构、数据配方、loss、调度、单步训练逻辑编成 `.so`；
   入口 `train.py` 刻意留明文——`torchrun` 会重新 import 入口模块、DataLoader spawn 子进程也要能 import，
   带 `if __name__=="__main__"` 的入口脚本经不起 Cython 编译 + 多进程的折腾。
-- **启动器**：`LAUNCHER=single`（单进程）或 `torchrun`（单机多进程，`--standalone` 自带 rendezvous）；
-  `deepspeed` / `accelerate` 已留分支占位，v1 未实装。demo 的 `train.py` 已兼容 torchrun（读 `RANK`/`WORLD_SIZE`）。
+- **启动器**：`LAUNCHER=single`（单进程）、`torchrun`（单机多进程，`--standalone` 自带 rendezvous）、
+  `deepspeed` 或 `accelerate`。后两者由项目在 requirements 里安装，额外参数走 `DEEPSPEED_ARGS` / `ACCELERATE_ARGS`。
+  demo 的 `train.py` 读 `RANK`/`WORLD_SIZE`，三种多进程启动器都能起。
 - **数据进、产物出全走挂载卷**：镜像不烘任何数据；checkpoint/日志落到 `OUTPUT_DIR`（默认 `/workspace/output`），
   运行时用 `-v` 挂到宿主取回。代码 `/app` 仍只读，只有产物目录和框架缓存可写。
 - **验收 = 冒烟训练**：跑一个短作业，断言「正常退出 + 落下 checkpoint + loss 有限且下降」，而非打接口。
@@ -60,6 +61,7 @@ bash engine/pack.sh tests/demo-train
 
 - **serve** 已在 vLLM / SGLang 生态上验证过完整打包流程（受保护模块真实 import 框架 API，编成 `.so` 组装进镜像）。
 - **train** 目前以 CPU torch demo 验证了完整链路（编译保护 → 起训 → 冒烟验收）；真实 GPU/CANN 框架的打包待在有卡环境验证。
+  `torchrun` / `deepspeed` / `accelerate` 都在 CPU 上验证过能拉起两个进程并跑完，但 demo 没有调用 `deepspeed.initialize` 和 `Accelerator`，它们和编译保护、真实 GPU 的配合还没验证。
 
 ## 边界
 
@@ -70,7 +72,10 @@ bash engine/pack.sh tests/demo-train
 - 加密只覆盖配置文件的内容：文件名和大小看得到；`CONFIG_GLOBS` 没覆盖到的配置仍是明文（打包时会警告）；
   数据集不在范围内，它本来就走挂载卷。代码自己把配置打进日志或存进 checkpoint，同样会泄漏，
   验收只能靠 `CONFIG_MARKER` 抽查这一段特征字符串。
-- 只支持用 `kiln_config` 读配置，暂不支持「框架只接受配置文件路径」的场景（那需要把明文落到临时文件）。
+- 框架只接受配置文件路径时可以开 `CONFIG_MATERIALIZE`，代价是作业期间明文在内存盘 `/dev/shm`，
+  能进容器的人直接 `cat` 就能读到，比只在进程内存里更容易拿。只写内存盘，不落磁盘，文件随容器消失。能用 `kiln_config` 读就别开。
+- 依赖默认按 pip 常规方式安装，不锁哈希，源码包的安装脚本会在构建时执行。需要加固时用 `PIP_INSTALL_ARGS` 开启，
+  它只作用于项目的 requirements，打包器自己装的 `Cython`、`cryptography` 不受影响。见 USAGE「依赖安装加固」。
 - **与 `torch.compile` 的张力**：dynamo 追踪 Python 字节码，编成 `.so` 的模块它无法追踪，会 graph-break 退回 eager。
   最想保护的热点逻辑和最想被 compile 优化的往往是同一块，需按场景二选一。
 - `.so` 认平台和 Python 版本：builder 与 runtime 的架构、Python 版本必须一致。

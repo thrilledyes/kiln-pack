@@ -53,20 +53,38 @@ fi
 
 PROTECT_GLOBS="${PROTECT_GLOBS:-}"
 PIP_REQUIREMENTS="${PIP_REQUIREMENTS:-}"
+# 透传给 pip install -r 的额外参数，默认空。比如 --require-hashes、--only-binary :all:。
+PIP_INSTALL_ARGS="${PIP_INSTALL_ARGS:-}"
+# 这个值走 --build-arg，会留在镜像历史里，所以带账号密码的索引地址不能写在这里。
+case "$PIP_INSTALL_ARGS" in
+  *://*@*)
+    echo "!! PIP_INSTALL_ARGS 不能带账号密码（它会留在镜像历史里），请改用 pip.conf 或 secret 挂载。" >&2
+    exit 2
+    ;;
+  *) ;;
+esac
 EXPOSE_PORT="${EXPOSE_PORT:-8000}"
 HEALTHCHECK_CMD="${HEALTHCHECK_CMD:-true}"
 SECRET_MARKER="${SECRET_MARKER:-}"
 REQUIRED_ENV="${REQUIRED_ENV:-}"
 
 # --- train profile 专属项（serve 用不到，留默认空值即可） ---
-LAUNCHER="${LAUNCHER:-single}"            # single | torchrun（deepspeed/accelerate 预留）
-NPROC_PER_NODE="${NPROC_PER_NODE:-1}"     # torchrun 单机进程数
+LAUNCHER="${LAUNCHER:-single}"            # single | torchrun | deepspeed | accelerate
+NPROC_PER_NODE="${NPROC_PER_NODE:-1}"     # 启动器的单机进程数
 TORCHRUN_ARGS="${TORCHRUN_ARGS:-}"        # 透传给 torchrun 的额外参数
+DEEPSPEED_ARGS="${DEEPSPEED_ARGS:-}"      # 透传给 deepspeed 的额外参数
+ACCELERATE_ARGS="${ACCELERATE_ARGS:-}"    # 透传给 accelerate launch 的额外参数
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/output}"  # 容器内产物目录（checkpoint/日志），运行时挂卷到宿主
 
 # --- 配置加密（train 专属）：on 时把 CONFIG_GLOBS 匹配的配置加密成 .enc，明文不进构建上下文 ---
 CONFIG_ENCRYPT="${CONFIG_ENCRYPT:-off}"
 CONFIG_GLOBS="${CONFIG_GLOBS:-}"
+# 框架只接受配置文件路径时，运行前解密到内存盘的配置（相对路径，空格分隔）。默认空，明文只在进程内存里。
+CONFIG_MATERIALIZE="${CONFIG_MATERIALIZE:-}"
+if [[ -n "$CONFIG_MATERIALIZE" && "$PROFILE" != train ]]; then
+  echo "!! CONFIG_MATERIALIZE 目前只支持 PROFILE=train（当前 ${PROFILE}）。" >&2
+  exit 2
+fi
 case "$CONFIG_ENCRYPT" in
   off) ;;
   on)
@@ -134,6 +152,12 @@ if [ "$CONFIG_ENCRYPT" = on ]; then
   done <<KILN_CONFIG_EOF
 $(printf '%s\n' "$CONFIG_LIST" | sort -u)
 KILN_CONFIG_EOF
+  for rel in $CONFIG_MATERIALIZE; do
+    if ! printf '%s\n' "$CONFIG_LIST" | grep -qxF -- "$rel"; then
+      echo "!! CONFIG_MATERIALIZE 里的 '${rel}' 不在 CONFIG_GLOBS 匹配到的文件里。" >&2
+      exit 2
+    fi
+  done
 fi
 
 BUILD_ID="$(date -u +%Y%m%dT%H%M%SZ)-$(( RANDOM % 9000 + 1000 ))"
@@ -150,6 +174,9 @@ echo "runtime 底座: $RUNTIME_BASE"
 echo "builder 底座: $BUILDER_BASE"
 [ "$PROFILE" = train ] && echo "launcher   : $LAUNCHER (nproc=$NPROC_PER_NODE)"
 [ "$PROFILE" = train ] && echo "配置加密   : $CONFIG_ENCRYPT"
+if [[ -n "$CONFIG_MATERIALIZE" ]]; then
+  echo "  [WARN] 开了 CONFIG_MATERIALIZE：作业期间这些配置的明文在 /dev/shm，能进容器的人可以直接读到: ${CONFIG_MATERIALIZE}" >&2
+fi
 echo
 
 # 用临时构建上下文，避免污染/依赖源码目录本身的 .dockerignore 之类的东西，
@@ -207,6 +234,14 @@ fi
 if [ "$PROFILE" = train ]; then
   mkdir -p "${BUILD_CTX}/.kiln/lib"
   cp "${ENGINE_DIR}/kiln_config.py" "${BUILD_CTX}/.kiln/lib/kiln_config.py"
+  # 训练依赖动辄几个 GB，单独放一份给 Dockerfile 提前安装，这样缓存只跟 requirements 的内容有关，
+  # 改代码、重新加密配置都不用重装。里面有相对路径时提前装会找不到文件，留空，退回代码就位后再装。
+  : > "${BUILD_CTX}/.kiln/pip-requirements.txt"
+  REQ_FILE="${BUILD_CTX}/${PIP_REQUIREMENTS}"
+  if [[ -n "$PIP_REQUIREMENTS" && -f "$REQ_FILE" ]] \
+    && ! grep -qE '^[[:space:]]*(-r|-c|-e|-f|--requirement|--constraint|--editable|--find-links|\.|/|file:)|@[[:space:]]*file:' "$REQ_FILE"; then
+    cp "$REQ_FILE" "${BUILD_CTX}/.kiln/pip-requirements.txt"
+  fi
 fi
 # 公共：编译保护助手（builder 阶段用）
 cp "${ENGINE_DIR}/compile_protect.py" "${BUILD_CTX}/.kiln/compile_protect.py"
@@ -229,8 +264,11 @@ set +f
   printf 'LAUNCHER=%s\n' "$LAUNCHER"
   printf 'NPROC_PER_NODE=%s\n' "$NPROC_PER_NODE"
   printf "TORCHRUN_ARGS='%s'\n" "$TORCHRUN_ARGS"
+  printf "DEEPSPEED_ARGS='%s'\n" "$DEEPSPEED_ARGS"
+  printf "ACCELERATE_ARGS='%s'\n" "$ACCELERATE_ARGS"
   printf "OUTPUT_DIR='%s'\n" "$OUTPUT_DIR"
   printf 'CONFIG_ENCRYPT=%s\n' "$CONFIG_ENCRYPT"
+  printf "CONFIG_MATERIALIZE='%s'\n" "$CONFIG_MATERIALIZE"
 } > "${BUILD_CTX}/.kiln/profile.conf"
 chmod +x "${BUILD_CTX}/.kiln/"*.sh
 
@@ -243,6 +281,7 @@ BUILD_ARGS=(
   --build-arg RUNTIME_BASE="$RUNTIME_BASE"
   --build-arg PROTECT_GLOBS="$(echo "$PROTECT_GLOBS" | tr '\n' ' ')"
   --build-arg PIP_REQUIREMENTS="$PIP_REQUIREMENTS"
+  --build-arg PIP_INSTALL_ARGS="$PIP_INSTALL_ARGS"
   --build-arg KILN_APP="$APP_NAME"
   --build-arg KILN_VERSION="$VERSION"
   --build-arg KILN_BUILD_ID="$BUILD_ID"
