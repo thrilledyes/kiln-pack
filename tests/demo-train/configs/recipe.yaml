@@ -1,0 +1,12 @@
+# 训练配方（示意）：真实场景里这是值钱的数据配比、课程、超参。
+# 打包时被加密成 recipe.yaml.enc，明文不进镜像；代码用 kiln_config.load_yaml 读取。
+recipe_tag: CONFIG_SECRET_DO_NOT_LEAK_d4e5f6
+model:
+  dim: 16
+  hidden: 64
+train:
+  batch: 64
+  base_lr: 0.1
+  warmup_ratio: 0.1
+loss:
+  huber_delta: 1.0

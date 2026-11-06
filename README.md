@@ -1,51 +1,81 @@
 # kiln-pack
 
-通用推理服务 **Docker 二进制打包器**。把值钱的 Python 源码在构建阶段编译成原生扩展（`.so`），
-最终镜像里只留二进制——源码不进镜像、不随交付物外发，服务照常可起、可查版本、可健康检查。
-面向 vLLM / SGLang / 自研编排等需要「上生产但不暴露源码」的场景。
+通用 **Docker 二进制打包器**，支持两种交付形态：
+
+- **serve** —— 常驻推理服务（vLLM / SGLang / 自研编排）：起服 + 健康检查 + 接口验收；
+- **train** —— 训练作业：按启动器起训 + 冒烟训练验收。
+
+核心一致：把值钱的 Python 源码在构建阶段用 Cython 编译成原生扩展（`.so`），最终镜像里只留二进制——
+源码不进镜像、不随交付物外发，服务/作业照常可跑、可查版本。面向「上生产但不暴露自研逻辑」的场景。
 
 ## 布局
 
 ```
-engine/   核心打包器（通用，不含任何具体项目痕迹）
-  pack.sh              主入口：读一份 pack.conf，产出镜像并验收
-  Dockerfile           两阶段构建：builder 编译保护 → runtime 干净底座
+engine/   公共引擎（与交付形态无关）
+  pack.sh              主入口：读一份 pack.conf，按 PROFILE 选形态，产出镜像并验收
   compile_protect.py   用 Cython 把受保护 .py 编成 .so，strip 符号、删明文与 .c
-  launch.sh            镜像内统一启动入口（校验必需 env 后起服）
-  healthcheck.sh       镜像内健康检查入口
-  verify.sh            验收：源码看不见 + 服务正常 + 可运维 三件事闭环检查
+  encrypt_config.py    打包阶段把配置加密成 .enc（train）
+  kiln_config.py       镜像内的配置读取助手：在内存里解密，明文不落盘（train）
+
+profiles/ 两种交付形态，各自的 Dockerfile + 启动/验收脚本
+  serve/   常驻服务：Dockerfile（非 root 只读）/ launch.sh / healthcheck.sh / verify.sh
+  train/   训练作业：Dockerfile（可写产物目录、无 HEALTHCHECK）/ launch.sh（LAUNCHER 分支）/ verify.sh（冒烟训练）
 
 tests/    测试环境（独立于引擎）
-  demo-fastapi/        最小 FastAPI 样例，含受保护的「假装很值钱」的打分逻辑
+  demo-fastapi/  最小 FastAPI 样例（PROFILE=serve），含受保护的打分逻辑
+  demo-train/    最小 CPU torch 训练样例（PROFILE=train），受保护模块含模型/数据/loss/调度/单步逻辑，超参配方在加密的 YAML 里
+  test_kiln_config.py  配置加密的单元测试
 ```
 
 ## 用法
 
 ```bash
-# <项目目录> 下放一份 pack.conf，描述底座镜像、要保护的 .py、起服命令等
+# 推理服务：
 bash engine/pack.sh tests/demo-fastapi
+# 训练作业（demo 开了配置加密，需要密钥；真实项目的密钥要自己保管好，丢了只能重新打包）：
+export KILN_CONFIG_KEY="$(openssl rand -base64 32)"
+bash engine/pack.sh tests/demo-train
 ```
 
-换推理框架时通常只写一份新的 `pack.conf`（换底座、列出要保护的文件），
-`engine/` 一字不动。配置项见 `tests/demo-fastapi/pack.conf` 的注释。
+交付形态由 `pack.conf` 里的 `PROFILE` 决定（不写默认 `serve`，兼容旧配置）。
+换框架/项目时通常只写一份新的 `pack.conf`，`engine/` 与 `profiles/` 一字不动。
 
-## 通用性测试
+## train profile 要点
 
-已在两个主流推理框架生态上验证过完整打包流程：
+- **只保护真正的 IP 模块**：模型结构、数据配方、loss、调度、单步训练逻辑编成 `.so`；
+  入口 `train.py` 刻意留明文——`torchrun` 会重新 import 入口模块、DataLoader spawn 子进程也要能 import，
+  带 `if __name__=="__main__"` 的入口脚本经不起 Cython 编译 + 多进程的折腾。
+- **启动器**：`LAUNCHER=single`（单进程）或 `torchrun`（单机多进程，`--standalone` 自带 rendezvous）；
+  `deepspeed` / `accelerate` 已留分支占位，v1 未实装。demo 的 `train.py` 已兼容 torchrun（读 `RANK`/`WORLD_SIZE`）。
+- **数据进、产物出全走挂载卷**：镜像不烘任何数据；checkpoint/日志落到 `OUTPUT_DIR`（默认 `/workspace/output`），
+  运行时用 `-v` 挂到宿主取回。代码 `/app` 仍只读，只有产物目录和框架缓存可写。
+- **验收 = 冒烟训练**：跑一个短作业，断言「正常退出 + 落下 checkpoint + loss 有限且下降」，而非打接口。
+- **配置加密**：`CONFIG_ENCRYPT="on"` 时，`CONFIG_GLOBS` 匹配的 YAML 等配置在打包机上加密成 `.enc`（AES-256-GCM），
+  明文和密钥都不经过 `docker build`，不进任何镜像层和构建缓存。运行时注入 `KILN_CONFIG_KEY`，代码用
+  `kiln_config.load_yaml()` 在内存里解密。开启后验收会逐层扫描镜像，并确认没有密钥或密钥不对时起不了训。
+- **GPU**：demo 用 CPU torch 跑通流程（无卡环境即可验收）。真实训练把 `RUNTIME_BASE`/`BUILDER_BASE`
+  换成带 CUDA/ROCm/CANN 的框架镜像，运行时加 `--gpus`，`init_process_group` 换 `nccl`/`hccl`。
 
-- **vLLM** 和 **SGLang** 各建一个独立工程，受保护模块真实 `import` 对应框架的 API（代表「基于该框架的自研调度 / 路由 / 采样逻辑」这类要保护的 IP），经本打包器编译成 `.so` 后组装进镜像。
-- 两者均完整通过验收：镜像内无受保护源码明文（仅余 `.so`、容器内 `cat` 不到）、服务正常起、`/version` 指纹正确、`/infer` 走通编译后的自研逻辑、机密标记已外置不随镜像发出。
+## 通用性
 
-测试中补齐了对「运行期需写 `~/.cache` 的重框架（如 torch / transformers）」的支持：runtime 以非 root 用户运行时提供可写家目录，避免这类框架在起服阶段因缓存目录不可写而失败。
+- **serve** 已在 vLLM / SGLang 生态上验证过完整打包流程（受保护模块真实 import 框架 API，编成 `.so` 组装进镜像）。
+- **train** 目前以 CPU torch demo 验证了完整链路（编译保护 → 起训 → 冒烟验收）；真实 GPU/CANN 框架的打包待在有卡环境验证。
 
 ## 边界
 
-- 保护的是**代码逻辑**，不是字符串常量：硬编码密钥用 `strings` 仍可从 `.so` 抠出，
-  敏感常量应走环境变量外置（`pack.conf` 的 `REQUIRED_ENV`）。
+- 保护的是**代码逻辑**，不是字符串常量：硬编码密钥用 `strings` 仍可从 `.so` 抠出，敏感常量走 `REQUIRED_ENV` 外置。
+- **配置加密防的是镜像外泄**：`.tar` 流出去了，没有密钥读不到配置。它防不住拿到密钥的人，
+  也防不住能进运行中容器的人：密钥在进程环境变量里（`docker inspect` 也看得到），明文在进程内存里。
+  要配置也不让运行方看到，只能把训练放在自己的环境里跑。
+- 加密只覆盖配置文件的内容：文件名和大小看得到；`CONFIG_GLOBS` 没覆盖到的配置仍是明文（打包时会警告）；
+  数据集不在范围内，它本来就走挂载卷。代码自己把配置打进日志或存进 checkpoint，同样会泄漏，
+  验收只能靠 `CONFIG_MARKER` 抽查这一段特征字符串。
+- 只支持用 `kiln_config` 读配置，暂不支持「框架只接受配置文件路径」的场景（那需要把明文落到临时文件）。
+- **与 `torch.compile` 的张力**：dynamo 追踪 Python 字节码，编成 `.so` 的模块它无法追踪，会 graph-break 退回 eager。
+  最想保护的热点逻辑和最想被 compile 优化的往往是同一块，需按场景二选一。
 - `.so` 认平台和 Python 版本：builder 与 runtime 的架构、Python 版本必须一致。
 - 这是**抬高抄袭门槛**，不是绝对加密。要「逻辑绝对不可得」只能把算法留在自己服务器、对外只给 API。
 
 ## 许可证
 
-Apache License 2.0，见 [LICENSE](LICENSE)。可自由用于商业与闭源项目，修改需保留版权与变更说明；
-如需专利授权与商标保护，本许可证已覆盖。
+Apache License 2.0，见 [LICENSE](LICENSE)。
