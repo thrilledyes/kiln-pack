@@ -9,7 +9,7 @@ set -eu
 . /app/.kiln/profile.conf
 
 echo "[kiln] app=${KILN_APP} version=${KILN_VERSION} build_id=${KILN_BUILD_ID} built_at=${KILN_BUILT_AT}"
-echo "[kiln] profile=train launcher=${LAUNCHER} nproc=${NPROC_PER_NODE} output=${OUTPUT_DIR}"
+echo "[kiln] profile=train launcher=${LAUNCHER} nproc=${NPROC_PER_NODE} output=${OUTPUT_DIR} config_encrypt=${CONFIG_ENCRYPT}"
 
 # 校验运行必需的环境变量（敏感常量外置后，缺了就拒绝起训，避免用空值裸跑浪费算力）。
 REQ_LIST=/app/.kiln/required_env.list

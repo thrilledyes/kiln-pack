@@ -7,11 +7,15 @@
 
 入口薄壳刻意留明文的另一个原因：torchrun / 多进程会重新 import 入口模块，
 带 `if __name__ == "__main__"` 的入口脚本经不起 Cython 编译 + spawn 的折腾。
+
+超参配方放在 configs/recipe.yaml，打包时加密，这里用 kiln_config 在内存里解密读取。
+配方是要保护的东西，所以日志和 checkpoint 里都不写配置内容。
 """
 import argparse
 import os
 
 import torch
+from kiln_config import load_yaml
 
 from trainer import recipe
 
@@ -19,10 +23,15 @@ from trainer import recipe
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=int(os.environ.get("KILN_STEPS", "50")))
-    ap.add_argument("--dim", type=int, default=16)
-    ap.add_argument("--batch", type=int, default=64)
-    ap.add_argument("--lr", type=float, default=0.1)
+    ap.add_argument("--config", default="configs/recipe.yaml")
     args = ap.parse_args()
+
+    cfg = load_yaml(args.config)
+    dim = cfg["model"]["dim"]
+    batch_size = cfg["train"]["batch"]
+    base_lr = cfg["train"]["base_lr"]
+    warmup_ratio = cfg["train"]["warmup_ratio"]
+    huber_delta = cfg["loss"]["huber_delta"]
 
     # 演示密钥外置：缺失时 launch.sh 已拦截起训；这里读一次，证明运行期注入可用。
     # 真实场景这类值用于拉私有数据/上报等，绝不写死进源码。
@@ -39,24 +48,23 @@ def main():
     torch.manual_seed(1234 + rank)
     device = torch.device("cpu")
 
-    model = recipe.build_model(args.dim).to(device)
+    model = recipe.build_model(dim, cfg["model"]["hidden"]).to(device)
     if is_dist:
         model = torch.nn.parallel.DistributedDataParallel(model)
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
+    optimizer = torch.optim.SGD(model.parameters(), lr=base_lr)
 
     out_dir = os.environ.get("KILN_OUTPUT_DIR", "/workspace/output")
     os.makedirs(out_dir, exist_ok=True)
 
     if rank == 0:
-        print(f"[train] 开始训练 steps={args.steps} dim={args.dim} batch={args.batch} "
-              f"world_size={world_size} device={device}", flush=True)
+        print(f"[train] 开始训练 steps={args.steps} world_size={world_size} device={device}", flush=True)
 
     for step in range(1, args.steps + 1):
-        batch = recipe.make_synthetic_batch(args.batch, args.dim, seed=step, device=device)
-        lr = recipe.lr_schedule(step, args.steps, args.lr)
+        batch = recipe.make_synthetic_batch(batch_size, dim, seed=step, device=device)
+        lr = recipe.lr_schedule(step, args.steps, base_lr, warmup_ratio)
         for group in optimizer.param_groups:
             group["lr"] = lr
-        loss = recipe.train_one_step(model, optimizer, batch)
+        loss = recipe.train_one_step(model, optimizer, batch, huber_delta)
         if rank == 0:
             print(f"[train] step={step} lr={lr:.5f} loss={loss:.6f}", flush=True)
 

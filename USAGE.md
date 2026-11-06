@@ -87,6 +87,8 @@ myproj/
     __init__.py
     train.py    # 训练入口（薄壳，留明文：torchrun 会重导入、spawn 要能 import）
     recipe.py   # 要保护的 IP：模型/数据/loss/调度/单步逻辑 —— 编成 .so
+  configs/
+    recipe.yaml # 要保护的超参配方 —— 打包时加密成 .enc（可选，见第 3.1 步）
 ```
 
 ### 3. 写 pack.conf（train 专属项）
@@ -107,7 +109,28 @@ START_CMD="python -m trainer.train --steps 50"
 SECRET_MARKER="CHANGE_ME_UNIQUE_MARKER"
 REQUIRED_ENV="KILN_SECRET_MARKER"
 VERIFY_ENV="KILN_SECRET_MARKER=whatever-for-verify"
-CONFIG_ENCRYPT="off"               # 配置/数据真加密的预留开关，v1 必须 off
+CONFIG_ENCRYPT="off"               # on 时加密配置，见下一步
+```
+
+### 3.1 加密 YAML 配置（可选）
+在 `pack.conf` 里打开：
+```bash
+CONFIG_ENCRYPT="on"
+CONFIG_GLOBS="configs/*.yaml"      # 要加密的文件，空格分隔；不支持 **，多层目录逐层写
+CONFIG_MARKER="CHANGE_ME_UNIQUE"   # 配置明文里的一段特征字符串，验收用它扫描泄漏
+```
+代码里这样读配置。明文只在内存里，`CONFIG_ENCRYPT` 开或关都不用改代码：
+```python
+from kiln_config import load_yaml
+cfg = load_yaml("configs/recipe.yaml")   # 相对 /app 的路径
+```
+- `load_yaml` 需要 PyYAML，把它加进项目的 `requirements.txt`；`cryptography` 由引擎自动安装。
+- 别在模块顶层读配置，builder 阶段的 import 自检拿不到密钥；放进函数里调用。
+- 别把配置内容打进日志或存进 checkpoint，这样明文就又出去了。
+
+密钥不写进 `pack.conf`，打包和运行都用环境变量：
+```bash
+export KILN_CONFIG_KEY="$(openssl rand -base64 32)"   # 自己保管好，丢了只能重新打包
 ```
 
 ### 4. 打包 + 冒烟验收
@@ -115,6 +138,8 @@ CONFIG_ENCRYPT="off"               # 配置/数据真加密的预留开关，v1 
 bash engine/pack.sh myproj
 ```
 验收会跑一个短作业，断言「正常退出 + 落下 checkpoint + loss 有限且下降」，看到 `验收通过` 即成功。
+开了配置加密时还会确认：镜像里没有配置明文、解密结果和明文一致、没有密钥或密钥不对时起不了训、
+所有镜像层和元数据里都没有明文特征和密钥。验收需要 `docker save` 整个镜像，要留够临时空间。
 
 ### 5. 交付与运行
 ```bash
@@ -123,17 +148,19 @@ docker load -i my-train-1.0.0.tar
 # 数据只读挂入，产物目录挂出；真实 GPU 训练加 --gpus all
 docker run --rm \
   -e KILN_SECRET_MARKER=... \
+  -e KILN_CONFIG_KEY \
   -v $(pwd)/data:/workspace/data:ro \
   -v $(pwd)/out:/workspace/output \
   my-train:1.0.0
 ```
 > 挂产物卷时确保宿主目录可被容器内用户（uid 10001）写入（如先 `chmod 777`，或用具名卷）。
+> `-e KILN_CONFIG_KEY` 只写名字，值取自当前 shell，不会留在命令历史里；没开配置加密就去掉这一行。
 
 ---
 
 ## 边界（务必知道）
 
 - 保护的是**代码逻辑**，不是字符串常量：敏感值一律走 `REQUIRED_ENV` 外置。
-- **配置/数据不是代码**：训练的数据配比/超参配方躺在 YAML/JSON 里，Cython 保护不了；`CONFIG_ENCRYPT` 预留，v1 不实装。
+- **配置加密防的是镜像外泄**：没有密钥读不到配置，但拿到密钥的人、能进运行中容器的人都能拿到明文（环境变量、`docker inspect`、进程内存）。文件名和大小不加密，数据集不在范围内。详见 README「边界」。
 - **`torch.compile` 冲突**：编成 `.so` 的模块 dynamo 无法追踪，会退回 eager；热点逻辑「保护」与「被 compile 优化」需二选一。
 - 这是**抬高抄袭门槛**，不是绝对加密。要「逻辑绝对不可得」，只能把算法留在自己服务器、对外只给 API。

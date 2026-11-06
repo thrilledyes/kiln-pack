@@ -16,14 +16,14 @@ import torch
 from torch import nn
 
 
-def build_model(dim: int) -> nn.Module:
+def build_model(dim: int, hidden: int) -> nn.Module:
     """自研模型结构（示意）。只用现成 nn 类拼装，避免在 Cython 模块里定义 Module 子类。"""
     return nn.Sequential(
-        nn.Linear(dim, 64),
+        nn.Linear(dim, hidden),
         nn.ReLU(),
-        nn.Linear(64, 64),
+        nn.Linear(hidden, hidden),
         nn.ReLU(),
-        nn.Linear(64, 1),
+        nn.Linear(hidden, 1),
     )
 
 
@@ -39,31 +39,30 @@ def make_synthetic_batch(n: int, dim: int, seed: int, device):
     return x.to(device), y.to(device)
 
 
-def proprietary_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+def proprietary_loss(pred: torch.Tensor, target: torch.Tensor, delta: float) -> torch.Tensor:
     """自研 loss（示意）：一段带阈值的 Huber，代表“对异常样本更鲁棒”的自家设计。"""
     diff = pred - target
     absd = diff.abs()
-    delta = 1.0
     quad = torch.clamp(absd, max=delta)
     lin = absd - quad
     return (0.5 * quad * quad + delta * lin).mean()
 
 
-def lr_schedule(step: int, total: int, base_lr: float) -> float:
-    """自研学习率调度（示意）：前 10% 线性 warmup，之后余弦退火。"""
-    warmup = max(1, total // 10)
+def lr_schedule(step: int, total: int, base_lr: float, warmup_ratio: float) -> float:
+    """自研学习率调度（示意）：先线性 warmup，之后余弦退火。"""
+    warmup = max(1, int(total * warmup_ratio))
     if step <= warmup:
         return base_lr * step / warmup
     progress = (step - warmup) / max(1, total - warmup)
     return 0.5 * base_lr * (1.0 + math.cos(math.pi * progress))
 
 
-def train_one_step(model: nn.Module, optimizer, batch) -> float:
+def train_one_step(model: nn.Module, optimizer, batch, huber_delta: float) -> float:
     """单步训练逻辑（示意）：前向 → 自研 loss → 反向 → 更新。返回标量 loss。"""
     x, y = batch
     optimizer.zero_grad(set_to_none=True)
     pred = model(x)
-    loss = proprietary_loss(pred, y)
+    loss = proprietary_loss(pred, y, huber_delta)
     loss.backward()
     optimizer.step()
     return float(loss.detach())

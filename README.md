@@ -14,6 +14,8 @@
 engine/   公共引擎（与交付形态无关）
   pack.sh              主入口：读一份 pack.conf，按 PROFILE 选形态，产出镜像并验收
   compile_protect.py   用 Cython 把受保护 .py 编成 .so，strip 符号、删明文与 .c
+  encrypt_config.py    打包阶段把配置加密成 .enc（train）
+  kiln_config.py       镜像内的配置读取助手：在内存里解密，明文不落盘（train）
 
 profiles/ 两种交付形态，各自的 Dockerfile + 启动/验收脚本
   serve/   常驻服务：Dockerfile（非 root 只读）/ launch.sh / healthcheck.sh / verify.sh
@@ -21,7 +23,8 @@ profiles/ 两种交付形态，各自的 Dockerfile + 启动/验收脚本
 
 tests/    测试环境（独立于引擎）
   demo-fastapi/  最小 FastAPI 样例（PROFILE=serve），含受保护的打分逻辑
-  demo-train/    最小 CPU torch 训练样例（PROFILE=train），受保护模块含模型/数据/loss/调度/单步逻辑
+  demo-train/    最小 CPU torch 训练样例（PROFILE=train），受保护模块含模型/数据/loss/调度/单步逻辑，超参配方在加密的 YAML 里
+  test_kiln_config.py  配置加密的单元测试
 ```
 
 ## 用法
@@ -29,7 +32,8 @@ tests/    测试环境（独立于引擎）
 ```bash
 # 推理服务：
 bash engine/pack.sh tests/demo-fastapi
-# 训练作业：
+# 训练作业（demo 开了配置加密，需要密钥；真实项目的密钥要自己保管好，丢了只能重新打包）：
+export KILN_CONFIG_KEY="$(openssl rand -base64 32)"
 bash engine/pack.sh tests/demo-train
 ```
 
@@ -46,6 +50,9 @@ bash engine/pack.sh tests/demo-train
 - **数据进、产物出全走挂载卷**：镜像不烘任何数据；checkpoint/日志落到 `OUTPUT_DIR`（默认 `/workspace/output`），
   运行时用 `-v` 挂到宿主取回。代码 `/app` 仍只读，只有产物目录和框架缓存可写。
 - **验收 = 冒烟训练**：跑一个短作业，断言「正常退出 + 落下 checkpoint + loss 有限且下降」，而非打接口。
+- **配置加密**：`CONFIG_ENCRYPT="on"` 时，`CONFIG_GLOBS` 匹配的 YAML 等配置在打包机上加密成 `.enc`（AES-256-GCM），
+  明文和密钥都不经过 `docker build`，不进任何镜像层和构建缓存。运行时注入 `KILN_CONFIG_KEY`，代码用
+  `kiln_config.load_yaml()` 在内存里解密。开启后验收会逐层扫描镜像，并确认没有密钥或密钥不对时起不了训。
 - **GPU**：demo 用 CPU torch 跑通流程（无卡环境即可验收）。真实训练把 `RUNTIME_BASE`/`BUILDER_BASE`
   换成带 CUDA/ROCm/CANN 的框架镜像，运行时加 `--gpus`，`init_process_group` 换 `nccl`/`hccl`。
 
@@ -57,8 +64,13 @@ bash engine/pack.sh tests/demo-train
 ## 边界
 
 - 保护的是**代码逻辑**，不是字符串常量：硬编码密钥用 `strings` 仍可从 `.so` 抠出，敏感常量走 `REQUIRED_ENV` 外置。
-- **配置/数据不等于代码**：训练的数据配比、超参配方常躺在 YAML/JSON 里，Cython 保护不了它们。
-  `pack.conf` 的 `CONFIG_ENCRYPT` 是预留开关位，**v1 必须为 `off`**，配置/数据的真加密（密文落盘 + 运行时解密）规划在 v2。
+- **配置加密防的是镜像外泄**：`.tar` 流出去了，没有密钥读不到配置。它防不住拿到密钥的人，
+  也防不住能进运行中容器的人：密钥在进程环境变量里（`docker inspect` 也看得到），明文在进程内存里。
+  要配置也不让运行方看到，只能把训练放在自己的环境里跑。
+- 加密只覆盖配置文件的内容：文件名和大小看得到；`CONFIG_GLOBS` 没覆盖到的配置仍是明文（打包时会警告）；
+  数据集不在范围内，它本来就走挂载卷。代码自己把配置打进日志或存进 checkpoint，同样会泄漏，
+  验收只能靠 `CONFIG_MARKER` 抽查这一段特征字符串。
+- 只支持用 `kiln_config` 读配置，暂不支持「框架只接受配置文件路径」的场景（那需要把明文落到临时文件）。
 - **与 `torch.compile` 的张力**：dynamo 追踪 Python 字节码，编成 `.so` 的模块它无法追踪，会 graph-break 退回 eager。
   最想保护的热点逻辑和最想被 compile 优化的往往是同一块，需按场景二选一。
 - `.so` 认平台和 Python 版本：builder 与 runtime 的架构、Python 版本必须一致。

@@ -7,7 +7,8 @@
 #     · 批作业不是常驻服务，不设 docker HEALTHCHECK、不 EXPOSE 端口；
 #     · 数据进、产物出都走挂载卷，镜像里不烘任何数据。
 # 编译器、Cython、.c 中间产物仍只留在 builder 阶段，不进最终镜像。
-# 注：builder 段与 profiles/serve/Dockerfile 保持同步，改一处记得改两处。
+# 配置加密：CONFIG_ENCRYPT=on 时 pack.sh 已在构建前加密好，这里只见得到 .enc，见不到明文和密钥。
+# 注：builder 段与 profiles/serve/Dockerfile 保持同步，改一处记得改两处（PYTHONPATH 那行是 train 专属）。
 
 ARG BUILDER_BASE=python:3.11-slim-bookworm
 ARG RUNTIME_BASE=python:3.11-slim-bookworm
@@ -34,6 +35,8 @@ RUN set -eux; \
     if [ -n "${PIP_REQUIREMENTS}" ] && [ -f "/src/${PIP_REQUIREMENTS}" ]; then \
       pip install --no-cache-dir -r "/src/${PIP_REQUIREMENTS}"; \
     fi
+# 受保护模块可能 import kiln_config，import 自检时要能找到它。
+ENV PYTHONPATH=/src/.kiln/lib${PYTHONPATH:+:${PYTHONPATH}}
 # 编译受保护源码 → .so，并删除对应 .py / .c
 RUN python /src/.kiln/compile_protect.py /src ${PROTECT_GLOBS}
 # 编译助手本身不是产物，去掉
@@ -48,6 +51,8 @@ ARG KILN_BUILT_AT=unknown
 ARG PIP_REQUIREMENTS=""
 # 容器内产物目录（checkpoint/日志）。运行时用 -v 挂到宿主；默认 /workspace/output。
 ARG KILN_OUTPUT_DIR=/workspace/output
+ARG CONFIG_ENCRYPT=off
+ENV PYTHONPATH=/app/.kiln/lib${PYTHONPATH:+:${PYTHONPATH}}
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     KILN_APP=${KILN_APP} \
@@ -69,6 +74,11 @@ RUN find /app -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null |
 RUN set -eux; \
     if [ -n "${PIP_REQUIREMENTS}" ] && [ -f "/app/${PIP_REQUIREMENTS}" ]; then \
       pip install --no-cache-dir -r "/app/${PIP_REQUIREMENTS}"; \
+    fi
+# 运行时解密配置要用
+RUN set -eux; \
+    if [ "${CONFIG_ENCRYPT}" = "on" ]; then \
+      pip install --no-cache-dir cryptography; \
     fi
 # 非 root 运行：抬高同容器内 ptrace / 读 /proc/<pid>/mem 等攻击门槛。
 # 代码 /app 仍只读（a+rX，不给写）；训练需要写的只有产物目录和框架缓存，
