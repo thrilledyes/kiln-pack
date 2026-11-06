@@ -8,10 +8,13 @@
 set -uo pipefail
 
 PROJECT_DIR="$(cd "${1:?用法: verify.sh <项目目录>}" && pwd)"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../engine" && pwd)/sensitive.sh"
 # shellcheck disable=SC1090
 source "$PROJECT_DIR/pack.conf"
 TAG="${APP_NAME}:${VERSION}"
 ORIGIN_MARKERS="${ORIGIN_MARKERS:-}"
+VERIFY_STOP_TIMEOUT="${VERIFY_STOP_TIMEOUT:-30}"  # docker stop 后等作业退出的秒数
 # 训练验收相关项（可在 pack.conf 覆盖）
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/output}"   # 容器内产物目录
 CKPT_GLOB="${CKPT_GLOB:-*.pt}"                   # 验收期望落下的 checkpoint（相对 OUTPUT_DIR）
@@ -23,7 +26,11 @@ bad()  { echo "  [FAIL] $*"; FAIL=1; }
 
 # 产物挂载目录、作业日志和镜像层解包目录都是临时文件，脚本中途失败也要清掉（踩过：日志漏在 $TMPDIR）。
 HOST_OUT=""; RUN_LOG=""; SCAN_DIR=""
-cleanup() { rm -rf "${HOST_OUT:-/nonexistent-kiln}" "${RUN_LOG:-/nonexistent-kiln}" "${SCAN_DIR:-/nonexistent-kiln}"; }
+STOP_NAME="kiln-verify-stop-$$"
+cleanup() {
+  docker rm -fv "$STOP_NAME" >/dev/null 2>&1 || true
+  rm -rf "${HOST_OUT:-/nonexistent-kiln}" "${RUN_LOG:-/nonexistent-kiln}" "${SCAN_DIR:-/nonexistent-kiln}"
+}
 trap cleanup EXIT
 
 sha256_of() {
@@ -50,6 +57,8 @@ KILN_PROT_EOF
 fi
 if echo "$LISTING" | grep -qE '\.(c|pyx)$'; then bad "镜像里有 .c/.pyx 中间产物"; else ok "无 .c/.pyx 中间产物"; fi
 if echo "$LISTING" | grep -q 'pack.conf'; then bad "镜像里有 pack.conf"; else ok "无 pack.conf"; fi
+SENSITIVE_HITS="$(kiln_sensitive_in_listing "$LISTING" "${PACK_KEEP:-}")"
+if [[ -n "$SENSITIVE_HITS" ]]; then bad "镜像里有敏感文件（确实要带上就写进 PACK_KEEP）:"; echo "$SENSITIVE_HITS" | sed 's/^/    /'; else ok "无敏感文件"; fi
 
 echo "== 3. 应用层扫描机密标记 =="
 # 聚焦 /app（受保护代码、.so、.kiln、产物）：机密只可能从项目代码/交付物泄漏，
@@ -65,7 +74,7 @@ if [ -n "${SECRET_MARKER:-}" ]; then
   else ok "静态交付物中无此敏感值——已外置为运行时注入"; fi
   echo "  [i] 边界：作业运行后该值会驻留进程内存，dump /proc/<pid>/mem 仍可取回；env 外置只保证不随镜像发出。"
 else
-  echo "  [i] 未设 SECRET_MARKER，跳过机密扫描。"
+  echo "  [WARN] 没设 SECRET_MARKER，跳过机密标记扫描，这一项没有验证过。"
 fi
 if echo "$LISTING" | grep -q '/app/.git'; then bad "镜像里有 .git"; else ok "无 .git"; fi
 
@@ -220,6 +229,30 @@ if [ -n "$FIRST_PROT" ]; then
     ok "容器内 cat 源码失败（符合预期）: /app/${FIRST_PROT}"
   fi
 fi
+
+echo "== 8. 停止信号 =="
+# 被抢占或 docker stop 时作业要收得到 SIGTERM，否则来不及存 checkpoint。退出码 137 说明是被 SIGKILL 杀掉的。
+docker run -d --name "$STOP_NAME" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} "$TAG" >/dev/null
+SECONDS=0
+while [[ "$SECONDS" -lt 60 ]]; do
+  STOP_LOG="$(docker logs "$STOP_NAME" 2>&1)"
+  if [[ "$STOP_LOG" == *'[kiln] 起训'* || "$(docker inspect -f '{{.State.Running}}' "$STOP_NAME" 2>/dev/null)" != true ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$(docker inspect -f '{{.State.Running}}' "$STOP_NAME" 2>/dev/null)" == true ]]; then
+  docker stop -t "$VERIFY_STOP_TIMEOUT" "$STOP_NAME" >/dev/null 2>&1
+  STOP_RC="$(docker inspect -f '{{.State.ExitCode}}' "$STOP_NAME" 2>/dev/null)"
+  if [[ "$STOP_RC" == 137 ]]; then
+    bad "docker stop 后作业被强杀（码 137）：没收到 SIGTERM，或 ${VERIFY_STOP_TIMEOUT} 秒内没退出（可调 VERIFY_STOP_TIMEOUT）"
+  else
+    ok "docker stop 后作业正常退出（码 ${STOP_RC}）"
+  fi
+else
+  echo "  [i] 作业在发出停止信号之前就结束了，这一项没有验证到。"
+fi
+docker rm -fv "$STOP_NAME" >/dev/null 2>&1
 
 echo
 [ "$FAIL" -eq 0 ] && echo "验收通过" || { echo "验收失败"; exit 1; }

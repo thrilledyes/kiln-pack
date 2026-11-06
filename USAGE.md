@@ -53,13 +53,27 @@ HEALTHCHECK_CMD="python -c \"import urllib.request,sys; sys.exit(0 if urllib.req
 SECRET_MARKER="CHANGE_ME_UNIQUE_MARKER"   # 敏感常量别硬编码进源码
 REQUIRED_ENV="MY_SECRET"                  # 起服必需的环境变量，缺了拒绝启动
 VERIFY_ENV="MY_SECRET=whatever-for-verify"
+VERIFY_TIMEOUT="60"                       # 等服务变健康的秒数，要加载模型的服务调大
+VERIFY_CMD='
+R="$(curl -fsS --max-time 30 "$VERIFY_BASE_URL/v1/models")"
+echo "$R"
+grep -q my-model <<<"$R"
+'
 ```
+
+- `HEALTHCHECK_CMD` 在容器内执行，通过前一直重试，直到 `VERIFY_TIMEOUT`。镜像里的 `HEALTHCHECK` 用的也是它。
+- `VERIFY_CMD` 是接口探针，健康检查通过后在打包机上用 `bash -euo pipefail` 执行一次，退出码非 0 判失败。
+  可以用 `$VERIFY_BASE_URL`（映射到本机的服务地址）、`$VERSION`、`$VERIFY_CONTAINER`（容器名）、`$PROJECT_DIR`。
+  探针写得长就放进脚本：`VERIFY_CMD='bash "$PROJECT_DIR/probe.sh"'`。写 `curl` 时记得带 `--max-time`。
+- **不写 `VERIFY_CMD` 也能通过验收，但只会给一条 `[WARN]`**：这时只确认了服务健康，没有验证接口和受保护逻辑。
+  引擎不再写死 `/healthz`、`/version`、`/infer`。以前靠这三个端点验收的项目，要把检查搬进 `VERIFY_CMD`，写法见 `tests/demo-fastapi/pack.conf`。
 
 ### 4. 打包 + 自动验收
 ```bash
 bash engine/pack.sh myproj
 ```
 两阶段构建 → 产出 `my-svc:1.0.0`，自动验收「源码看不见 + 服务正常起 + 可运维」。看到 `验收通过` 即成功。
+注意 `[WARN]`：它表示有一项没有验证到，比如没设 `SECRET_MARKER` 时跳过了机密标记扫描。
 
 ### 5. 导出 `.tar` 交付
 ```bash
@@ -178,6 +192,33 @@ docker run --rm \
 > `-e KILN_CONFIG_KEY` 只写名字，值取自当前 shell，不会留在命令历史里；没开配置加密就去掉这一行。
 
 ---
+
+## 敏感文件（serve 和 train 都生效）
+
+这些文件默认不进镜像，打包时会逐个提示：
+
+- 环境变量文件：`*.env`、`.env.*`、`.envrc`
+- 密钥和证书：`*.pem`、`*.key`、`*.p12`、`*.pfx`、`*.jks`、`*.keystore`、`id_rsa`、`id_dsa`、`id_ecdsa`、`id_ed25519`
+- 凭据：`.netrc`、`.pypirc`、`.npmrc`、`.git-credentials`、`credentials.json`、`service-account*.json`
+- 凭据目录：`.ssh/`、`.aws/`、`.gnupg/`
+
+验收时如果在 `/app` 里发现命中规则的文件，会直接判失败。确实要随镜像发出的文件（比如公开的 CA 证书），逐个写完整路径：
+
+```bash
+PACK_KEEP="certs/ca.pem certs/intermediate.pem"   # 相对 SRC_DIR，不支持通配，凭据目录里的文件不能放行
+```
+
+这份规则只认文件名，查不出名字普通、内容却是密钥的文件。依赖安装和配置文件里的凭据也不在范围内。
+
+## 停止信号（serve 和 train 都生效）
+
+容器的 PID 1 是 `.kiln/kiln_init.py`，它把 `SIGTERM` 等信号转给作业的整个进程组，等整组退完才结束，并传回退出码。
+
+- **训练想在被抢占时存 checkpoint：** 在代码里装 `SIGTERM` 处理函数。没装的话，作业收到信号就直接退出。
+- **处理函数最好能重复进入：** 启动器自己也可能转发信号。CPU 上 `torchrun` 两进程实测每个 worker 只收到一次，`deepspeed` 和 `accelerate` 没有测过。
+- **退出码看启动器：** `single` 存完正常退出时是 0；`torchrun` 被停止时实测是 1，就算 worker 都存完了也一样。判断有没有存完要看产物，别只看退出码。
+- **留够退出时间：** `docker stop` 默认的等待时间不够存 checkpoint，要用 `docker stop -t 120` 这样显式给够，K8s 对应 `terminationGracePeriodSeconds`。
+- **验收：** 会真的 `docker stop` 一次，退出码 137 判失败。收尾慢的服务调大 `VERIFY_STOP_TIMEOUT`（默认 30 秒）。
 
 ## 依赖安装加固（可选，serve 和 train 都能用）
 

@@ -88,4 +88,10 @@ case "${LAUNCHER}" in
 esac
 
 echo "[kiln] 起训: ${RUN_CMD}"
-exec /bin/sh -c "${RUN_CMD}"
+# kiln_init 当 PID 1，被抢占或 docker stop 时作业才收得到 SIGTERM，有机会存 checkpoint。详见 kiln_init.py。
+KILN_PY="$(command -v python || command -v python3 || true)"
+if [ -z "${KILN_PY}" ]; then
+  echo "[kiln] 找不到 python，无法转发停止信号，docker stop 时作业可能被强杀。" >&2
+  exec /bin/sh -c "${RUN_CMD}"
+fi
+exec "${KILN_PY}" -I -S /app/.kiln/kiln_init.py /bin/sh -c "${RUN_CMD}"

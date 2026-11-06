@@ -1,0 +1,457 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+# kiln-pack 端到端验收：真的打镜像、起容器，覆盖「该通过的通过、该失败的失败」。
+# 用法: bash tests/acceptance.sh [场景名...]     不带参数跑全部，场景名见文件末尾。
+# 需要 Docker、rsync、perl、openssl。镜像都以 kiln-acc- 开头，跑完自动清掉；构建缓存留着。
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+WORK="$(mktemp -d)"
+LOG="${WORK}/out.log"
+KILN_CONFIG_KEY="$(openssl rand -base64 32)"
+export KILN_CONFIG_KEY
+PASSED=0
+FAILED=0
+SCENARIO=""
+PACK_RC=0
+
+cleanup() {
+  local images
+  docker ps -aq --filter 'name=^kiln-acc-' | xargs docker rm -fv >/dev/null 2>&1
+  images="$(docker images --format '{{.Repository}}:{{.Tag}}' | grep -E '^kiln-acc-')"
+  if [[ -n "$images" ]]; then
+    printf '%s\n' "$images" | xargs docker rmi -f >/dev/null 2>&1
+  fi
+  docker rmi kiln-config-tool:local >/dev/null 2>&1
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+passed() { PASSED=$((PASSED + 1)); echo "  [符合预期] $*"; }
+failed() {
+  FAILED=$((FAILED + 1))
+  echo "  [不符合预期] ${SCENARIO}: $*"
+  grep -E '\[FAIL\]|!!|ERROR' "$LOG" 2>/dev/null | LC_ALL=C cut -c1-200 | tail -8 | sed 's/^/      /'
+}
+check_rc() { if [[ "$PACK_RC" -eq "$1" ]]; then passed "退出码 $1"; else failed "退出码是 ${PACK_RC}，期望 $1"; fi; }
+check_log() { if grep -qF -e "$1" "$LOG"; then passed "日志有: $1"; else failed "日志里没有: $1"; fi; }
+check_nolog() { if grep -qF -e "$1" "$LOG"; then failed "日志里不该有: $1"; else passed "日志没有: $1"; fi; }
+
+# new_project <名字> <tests 下的模板>：复制模板，改成带 kiln-acc- 前缀的镜像名。
+new_project() {
+  local name="$1" template="$2"
+  cp -R "${ROOT}/tests/${template}" "${WORK}/${name}"
+  printf '\nAPP_NAME="kiln-acc-%s"\n' "$name" >> "${WORK}/${name}/pack.conf"
+}
+
+# new_service <名字>：不依赖 demo 接口约定的最小服务，接口是 /health 和 /v1/completions，只用标准库。
+new_service() {
+  local dir="${WORK}/$1"
+  mkdir -p "${dir}/svc"
+  : > "${dir}/svc/__init__.py"
+  cat > "${dir}/svc/logic.py" <<'EOF'
+def complete(prompt):
+    return prompt[::-1]
+EOF
+  cat > "${dir}/server.py" <<'EOF'
+import json
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+from svc.logic import complete
+
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, body):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(json.dumps(body).encode())
+
+    def do_GET(self):
+        self._send({"status": "up"})
+
+    def do_POST(self):
+        self._send({"choices": [{"text": complete("abc")}]})
+
+
+HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+EOF
+  cat > "${dir}/pack.conf" <<EOF
+PROFILE="serve"
+APP_NAME="kiln-acc-$1"
+VERSION="1.0.0"
+RUNTIME_BASE="python:3.11-slim-bookworm"
+BUILDER_BASE="python:3.11-slim-bookworm"
+SRC_DIR="."
+PROTECT_GLOBS="svc/logic.py"
+START_CMD="python server.py"
+EXPOSE_PORT="8000"
+HEALTHCHECK_CMD="python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\""
+EOF
+}
+
+pack() {
+  echo "    打包 $1"
+  bash "${ROOT}/engine/pack.sh" "${WORK}/$1" > "$LOG" 2>&1
+  PACK_RC=$?
+}
+
+verify() {
+  bash "${ROOT}/profiles/$2/verify.sh" "${WORK}/$1" > "$LOG" 2>&1
+  PACK_RC=$?
+}
+
+# ---------- serve：接口探针 ----------
+scenario_serve_demo() {
+  new_project serve-demo demo-fastapi
+  pack serve-demo
+  check_rc 0
+  check_log '接口探针通过'
+  check_log 'docker stop 后服务正常退出'
+  check_log '控制样本扫到了'
+}
+
+scenario_serve_custom_api() {
+  new_service serve-api
+  cat >> "${WORK}/serve-api/pack.conf" <<'EOF'
+SECRET_MARKER="ACC_MARKER_NOT_IN_IMAGE_91bd"
+VERIFY_CMD='
+R="$(curl -fsS --max-time 10 -X POST "$VERIFY_BASE_URL/v1/completions" -d "{}")"
+echo "completion: $R"
+grep -q cba <<<"$R"
+'
+EOF
+  pack serve-api
+  check_rc 0
+  check_log '接口探针通过'
+  check_log 'completion:'
+  check_log '文本文件无标记'
+  check_log 'docker stop 后服务正常退出'
+}
+
+scenario_serve_no_probe() {
+  new_service serve-noprobe
+  pack serve-noprobe
+  check_rc 0
+  check_log '没设 VERIFY_CMD'
+}
+
+scenario_serve_probe_fails() {
+  new_service serve-probefail
+  cat >> "${WORK}/serve-probefail/pack.conf" <<'EOF'
+VERIFY_CMD='echo probe-ran; exit 3'
+EOF
+  pack serve-probefail
+  check_rc 1
+  check_log 'probe-ran'
+  check_log '接口探针失败（码 3）'
+}
+
+scenario_serve_probe_pipe_fails() {
+  # 管道前半段失败也要算失败，否则 curl 失败会被 grep 的结果盖住。
+  new_service serve-pipefail
+  cat >> "${WORK}/serve-pipefail/pack.conf" <<'EOF'
+VERIFY_CMD='false | true'
+EOF
+  pack serve-pipefail
+  check_rc 1
+  check_log '接口探针失败'
+}
+
+scenario_serve_health_timeout() {
+  new_service serve-unhealthy
+  cat >> "${WORK}/serve-unhealthy/pack.conf" <<'EOF'
+HEALTHCHECK_CMD="false"
+VERIFY_TIMEOUT="3"
+VERIFY_CMD='echo probe-should-not-run'
+EOF
+  pack serve-unhealthy
+  check_rc 1
+  check_log '3 秒内健康检查没有通过'
+  check_nolog 'probe-should-not-run'
+}
+
+scenario_serve_exits_early() {
+  new_service serve-early
+  cat >> "${WORK}/serve-early/pack.conf" <<'EOF'
+START_CMD='python -c "raise SystemExit(3)"'
+EOF
+  pack serve-early
+  check_rc 1
+  check_log '服务提前退出（码 3）'
+}
+
+# ---------- serve：扫描不能假通过 ----------
+scenario_marker_unset() {
+  new_service marker-unset
+  pack marker-unset
+  check_rc 0
+  check_log '没设 SECRET_MARKER'
+  check_nolog '文本文件无标记'
+  check_nolog '文本文件里发现标记'
+}
+
+scenario_marker_empty() {
+  new_service marker-empty
+  printf 'SECRET_MARKER=""\n' >> "${WORK}/marker-empty/pack.conf"
+  pack marker-empty
+  check_rc 0
+  check_log '没设 SECRET_MARKER'
+  check_nolog '文本文件里发现标记'
+}
+
+scenario_marker_leak() {
+  new_service marker-leak
+  printf 'ACC_LEAKED_MARKER_55aa\n' > "${WORK}/marker-leak/notes.txt"
+  printf 'SECRET_MARKER="ACC_LEAKED_MARKER_55aa"\n' >> "${WORK}/marker-leak/pack.conf"
+  pack marker-leak
+  check_rc 1
+  check_log '文本文件里发现标记'
+}
+
+scenario_export_fails() {
+  local shim real
+  new_service export-fail
+  printf 'SECRET_MARKER="ACC_MARKER_NOT_IN_IMAGE_91bd"\n' >> "${WORK}/export-fail/pack.conf"
+  pack export-fail
+  check_rc 0
+  real="$(command -v docker)"
+  shim="${WORK}/shim"
+  mkdir -p "$shim"
+  cat > "${shim}/docker" <<EOF
+#!/bin/sh
+if [ "\$1" = export ]; then exit 1; fi
+exec "${real}" "\$@"
+EOF
+  chmod +x "${shim}/docker"
+  PATH="${shim}:${PATH}" verify export-fail serve
+  check_rc 1
+  check_log 'docker export 失败'
+  check_nolog '文本文件无标记'
+}
+
+# ---------- 敏感文件 ----------
+scenario_sensitive_excluded() {
+  local dir="${WORK}/sensitive" files
+  new_service sensitive
+  mkdir -p "${dir}/sub" "${dir}/certs" "${dir}/.aws" "${dir}/.ssh"
+  for f in .env sub/.env prod.env tls.key sub/server.pem id_rsa .pypirc .aws/credentials .ssh/config certs/ca.pem certs/other.pem; do
+    printf 'x\n' > "${dir}/${f}"
+  done
+  printf 'PACK_KEEP="certs/ca.pem"\n' >> "${dir}/pack.conf"
+  pack sensitive
+  check_rc 0
+  check_log '敏感文件不会进镜像（确实要带上就写进 PACK_KEEP）: .env'
+  check_log 'PACK_KEEP 放行，这个敏感文件会进镜像: certs/ca.pem'
+  check_log '无敏感文件'
+  files="$(docker run --rm --entrypoint /bin/sh kiln-acc-sensitive:1.0.0 -c 'find /app -type f | sort')"
+  for f in .env sub/.env prod.env tls.key sub/server.pem id_rsa .pypirc .aws/credentials .ssh/config certs/other.pem; do
+    if printf '%s\n' "$files" | grep -qxF "/app/${f}"; then failed "镜像里有 ${f}"; else passed "镜像里没有 ${f}"; fi
+  done
+  if printf '%s\n' "$files" | grep -qxF /app/certs/ca.pem; then passed "放行的 certs/ca.pem 在镜像里"; else failed "放行的 certs/ca.pem 不在镜像里"; fi
+
+  # 排除规则漏了也要拦得住：往镜像里塞一个，验收必须判失败。
+  printf 'FROM kiln-acc-sensitive:1.0.0\nUSER root\nRUN touch /app/.env\nUSER appuser\n' \
+    | docker build -q -t kiln-acc-sensitive:1.0.0 - >/dev/null
+  verify sensitive serve
+  check_rc 1
+  check_log '镜像里有敏感文件'
+}
+
+scenario_keep_rejected() {
+  local bad
+  new_service keep-bad
+  mkdir -p "${WORK}/keep-bad/.aws"
+  printf 'x\n' > "${WORK}/keep-bad/.aws/my.pem"
+  for bad in no-such.pem server.py .aws/my.pem '*.pem' ../x.pem /etc/x.pem; do
+    cp "${WORK}/keep-bad/pack.conf" "${WORK}/keep-bad/pack.conf.orig"
+    printf 'PACK_KEEP="%s"\n' "$bad" >> "${WORK}/keep-bad/pack.conf"
+    pack keep-bad
+    if [[ "$PACK_RC" -eq 2 ]]; then passed "拒绝 PACK_KEEP=${bad}"; else failed "PACK_KEEP=${bad} 退出码 ${PACK_RC}，期望 2"; fi
+    mv "${WORK}/keep-bad/pack.conf.orig" "${WORK}/keep-bad/pack.conf"
+  done
+}
+
+scenario_train_sensitive() {
+  new_project train-sensitive demo-train
+  printf 'x\n' > "${WORK}/train-sensitive/.env"
+  printf 'x\n' > "${WORK}/train-sensitive/tls.key"
+  pack train-sensitive
+  check_rc 0
+  check_log '敏感文件不会进镜像（确实要带上就写进 PACK_KEEP）: .env'
+  check_log '无敏感文件'
+}
+
+# ---------- train：回归和退出码 ----------
+scenario_train_demo() {
+  new_project train-demo demo-train
+  pack train-demo
+  check_rc 0
+  check_log 'docker stop 后作业正常退出'
+  check_log '所有镜像层里无配置明文'
+}
+
+scenario_train_exit_code() {
+  new_project train-exit demo-train
+  cat >> "${WORK}/train-exit/pack.conf" <<'EOF'
+START_CMD='python -c "raise SystemExit(7)"'
+EOF
+  pack train-exit
+  check_rc 1
+  check_log '作业退出码: 7'
+}
+
+scenario_train_compound_cmd() {
+  new_project train-compound demo-train
+  cat >> "${WORK}/train-compound/pack.conf" <<'EOF'
+START_CMD='export KILN_STEPS=30; python -m trainer.train'
+EOF
+  pack train-compound
+  check_rc 0
+  check_log 'steps=30'
+}
+
+# ---------- train：停止信号要到得了 worker ----------
+# 给 demo 加一个 SIGTERM 处理函数和原地等待，模拟训练被抢占时存 checkpoint。
+add_signal_hook() {
+  local dir="${WORK}/$1"
+  cat > "${dir}/trainer/sig_hook.py" <<'EOF'
+import os
+import signal
+import time
+
+got = []
+
+
+def install():
+    def on_term(*_):
+        got.append(1)
+        print(f"[sig] rank={os.environ.get('RANK', '0')} 收到 SIGTERM 第 {len(got)} 次", flush=True)
+
+    signal.signal(signal.SIGTERM, on_term)
+
+
+def hold():
+    if not os.environ.get("KILN_HOLD"):
+        return
+    print(f"[sig] rank={os.environ.get('RANK', '0')} 等待信号", flush=True)
+    while not got:
+        time.sleep(0.2)
+    time.sleep(3)
+    print(f"[sig] rank={os.environ.get('RANK', '0')} checkpoint 已保存", flush=True)
+EOF
+  perl -0pi -e 's/def main\(\):\n/def main():\n    from trainer.sig_hook import hold, install\n    install()\n/; s/    if rank == 0:\n        ckpt_path/    hold()\n    if rank == 0:\n        ckpt_path/' "${dir}/trainer/train.py"
+}
+
+# stop_held_job <项目名> <worker 数>：作业等在原地，docker stop 后看每个 worker 是否收到信号并存完。
+stop_held_job() {
+  local name="kiln-acc-stop-$1" image="kiln-acc-$1:1.0.0" workers="$2" i rc saved
+  docker run -d --name "$name" -e KILN_HOLD=1 -e KILN_CONFIG_KEY \
+    -e KILN_SECRET_MARKER=TRAIN_SECRET_DO_NOT_LEAK_a1b2c3 "$image" >/dev/null
+  for i in $(seq 1 90); do
+    docker logs "$name" > "$LOG" 2>&1
+    if [[ "$(grep -c '等待信号' "$LOG")" -ge "$workers" ]]; then break; fi
+    sleep 1
+  done
+  docker stop -t 30 "$name" >/dev/null
+  rc="$(docker inspect -f '{{.State.ExitCode}}' "$name")"
+  docker logs "$name" > "$LOG" 2>&1
+  docker rm -fv "$name" >/dev/null
+  echo "    退出码 ${rc}"; grep '\[sig\]' "$LOG" | sed 's/^/    /'
+  if [[ "$rc" != 137 ]]; then passed "没有被强杀（码 ${rc}）"; else failed "被强杀（码 137）"; fi
+  # demo 自己也会打印「checkpoint 已保存」，所以只数 [sig] 这句。多进程的输出可能挤在一行，按匹配次数数，不按行数。
+  saved="$(grep -oE '\[sig\] rank=[0-9]+ checkpoint 已保存' "$LOG" | wc -l | tr -d ' ')"
+  if [[ "$saved" -eq "$workers" ]]; then
+    passed "${workers} 个 worker 都收到信号并存完"
+  else
+    failed "存完的 worker 数是 ${saved}，期望 ${workers}"
+  fi
+}
+
+scenario_signal_single() {
+  new_project sig-single demo-train
+  add_signal_hook sig-single
+  pack sig-single
+  check_rc 0
+  stop_held_job sig-single 1
+}
+
+scenario_signal_torchrun() {
+  new_project sig-torchrun demo-train
+  add_signal_hook sig-torchrun
+  cat >> "${WORK}/sig-torchrun/pack.conf" <<'EOF'
+LAUNCHER="torchrun"
+NPROC_PER_NODE="2"
+VERIFY_LOG_CONTAINS="world_size=2"
+EOF
+  pack sig-torchrun
+  check_rc 0
+  stop_held_job sig-torchrun 2
+}
+
+# ---------- train：启动器回归（launch.sh 的启动方式改过，都要重新跑通） ----------
+scenario_launcher_accelerate() {
+  new_project launcher-accelerate demo-train
+  printf 'accelerate\nnumpy\n' >> "${WORK}/launcher-accelerate/requirements.txt"
+  cat >> "${WORK}/launcher-accelerate/pack.conf" <<'EOF'
+LAUNCHER="accelerate"
+NPROC_PER_NODE="2"
+ACCELERATE_ARGS="--multi_gpu"
+VERIFY_LOG_CONTAINS="world_size=2"
+EOF
+  pack launcher-accelerate
+  check_rc 0
+  check_log 'docker stop 后作业正常退出'
+}
+
+scenario_launcher_deepspeed() {
+  new_project launcher-deepspeed demo-train
+  printf 'deepspeed\nnumpy\n' >> "${WORK}/launcher-deepspeed/requirements.txt"
+  printf 'localhost slots=2\n' > "${WORK}/launcher-deepspeed/hostfile"
+  cat >> "${WORK}/launcher-deepspeed/pack.conf" <<'EOF'
+LAUNCHER="deepspeed"
+NPROC_PER_NODE="2"
+DEEPSPEED_ARGS="--hostfile=hostfile --no_ssh_check --master_addr=127.0.0.1 --no_local_rank"
+VERIFY_LOG_CONTAINS="world_size=2"
+EOF
+  pack launcher-deepspeed
+  check_rc 0
+  check_log 'docker stop 后作业正常退出'
+}
+
+scenario_config_materialize() {
+  local dir="${WORK}/materialize"
+  new_project materialize demo-train
+  cat >> "${dir}/pack.conf" <<'EOF'
+LAUNCHER="torchrun"
+NPROC_PER_NODE="2"
+VERIFY_LOG_CONTAINS="world_size=2"
+CONFIG_MATERIALIZE="configs/recipe.yaml"
+START_CMD='python -m trainer.train --steps 50 --config-path ${KILN_CONFIG_DIR}/configs/recipe.yaml'
+EOF
+  perl -pi -e 's/^(\s*)ap\.add_argument\("--config", default="configs\/recipe\.yaml"\)$/$1ap.add_argument("--config-path", required=True)/; s/^(\s*)cfg = load_yaml\(args\.config\)$/$1import yaml\n$1cfg = yaml.safe_load(open(args.config_path))/' "${dir}/trainer/train.py"
+  pack materialize
+  check_rc 0
+  check_log '配置已解密到内存盘'
+}
+
+ALL_SCENARIOS="
+serve_demo serve_custom_api serve_no_probe serve_probe_fails serve_probe_pipe_fails
+serve_health_timeout serve_exits_early
+marker_unset marker_empty marker_leak export_fails
+sensitive_excluded keep_rejected train_sensitive
+train_demo train_exit_code train_compound_cmd
+signal_single signal_torchrun
+launcher_accelerate launcher_deepspeed config_materialize
+"
+
+for SCENARIO in ${*:-$ALL_SCENARIOS}; do
+  echo
+  echo "######## ${SCENARIO}"
+  STARTED="$(date +%s)"
+  "scenario_${SCENARIO}"
+  echo "    耗时 $(( $(date +%s) - STARTED )) 秒"
+done
+
+echo
+echo "符合预期 ${PASSED} 项，不符合预期 ${FAILED} 项"
+[[ "$FAILED" -eq 0 ]]

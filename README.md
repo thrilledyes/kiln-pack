@@ -16,6 +16,8 @@ engine/   公共引擎（与交付形态无关）
   compile_protect.py   用 Cython 把受保护 .py 编成 .so，strip 符号、删明文与 .c
   encrypt_config.py    打包阶段把配置加密成 .enc（train）
   kiln_config.py       镜像内的配置读取助手：在内存里解密，明文不落盘（train）
+  kiln_init.py         容器的 PID 1：把 docker stop 的信号转给作业，传回退出码
+  sensitive.sh         敏感文件规则：打包时排除，验收时发现就判失败
 
 profiles/ 两种交付形态，各自的 Dockerfile + 启动/验收脚本
   serve/   常驻服务：Dockerfile（非 root 只读）/ launch.sh / healthcheck.sh / verify.sh
@@ -25,6 +27,9 @@ tests/    测试环境（独立于引擎）
   demo-fastapi/  最小 FastAPI 样例（PROFILE=serve），含受保护的打分逻辑
   demo-train/    最小 CPU torch 训练样例（PROFILE=train），受保护模块含模型/数据/loss/调度/单步逻辑，超参配方在加密的 YAML 里
   test_kiln_config.py  配置加密的单元测试
+  test_kiln_init.py    信号转发的单元测试
+  test_sensitive.py    敏感文件规则的单元测试
+  acceptance.sh        需要 Docker 的端到端验收，覆盖敏感文件、验收假结果、接口探针、停止信号和各启动器
 ```
 
 ## 用法

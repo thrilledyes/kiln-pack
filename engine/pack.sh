@@ -14,6 +14,8 @@ set -euo pipefail
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${ENGINE_DIR}/.." && pwd)"
+# shellcheck disable=SC1091
+source "${ENGINE_DIR}/sensitive.sh"
 
 if [ $# -lt 1 ]; then
   echo "用法: $0 <项目目录，含 pack.conf> [额外 docker build 参数...]" >&2
@@ -110,6 +112,35 @@ esac
 
 SRC_ABS="$(cd "${PROJECT_DIR}/${SRC_DIR}" && pwd)"
 
+# 敏感文件默认不进构建上下文。确实要随镜像发出的（比如公开的 CA 证书）逐个写进 PACK_KEEP，
+# 只接受相对 SRC_DIR 的完整路径，不接受通配，免得一条规则把私钥也放行了。
+PACK_KEEP="${PACK_KEEP:-}"
+KEEP_ARGS=()
+set -f
+for rel in $PACK_KEEP; do
+  case "$rel" in
+    /*|..|../*|*/..|*/../*|*'*'*|*'?'*|*'['*)
+      echo "!! PACK_KEEP 只接受源码目录内的完整相对路径: ${rel}" >&2
+      exit 2
+      ;;
+    *) ;;
+  esac
+  if [[ ! -f "${SRC_ABS}/${rel}" || -L "${SRC_ABS}/${rel}" ]]; then
+    echo "!! PACK_KEEP 里的 '${rel}' 不是源码目录内的普通文件。" >&2
+    exit 2
+  fi
+  if ! kiln_sensitive_match "$rel"; then
+    echo "!! PACK_KEEP 里的 '${rel}' 没有命中敏感规则，不需要放行。" >&2
+    exit 2
+  fi
+  if kiln_sensitive_in_dir "$rel"; then
+    echo "!! ${rel} 在凭据目录里，不能放行，请把要发布的文件挪到别处。" >&2
+    exit 2
+  fi
+  KEEP_ARGS+=("--include=/${rel}")
+done
+set +f
+
 # 展开 CONFIG_GLOBS，每行输出一个相对路径。任何一条有问题都中止，宁可打包失败也不让明文漏进镜像。
 expand_config_globs() (
   cd "$SRC_ABS" || exit 1
@@ -184,10 +215,22 @@ echo
 BUILD_CTX="$(mktemp -d)"
 trap 'rm -rf "$BUILD_CTX"' EXIT
 
-echo "-- 1/3 复制构建上下文（排除 .git / 证据目录 / 预编译产物）"
+echo "-- 1/3 复制构建上下文（排除 .git / 证据目录 / 预编译产物 / 敏感文件）"
+DROPPED="$(cd "$SRC_ABS" && find . -name .git -prune -o \( "${KILN_SENSITIVE_FIND_ARGS[@]}" \) -print 2>/dev/null | sed 's|^\./||' || true)"
+if [[ -n "$DROPPED" ]]; then
+  while IFS= read -r rel; do
+    case " $(printf '%s' "$PACK_KEEP" | tr '\n\t' '  ') " in
+      *" ${rel} "*) echo "  [WARN] PACK_KEEP 放行，这个敏感文件会进镜像: ${rel}" >&2 ;;
+      *) echo "  [WARN] 敏感文件不会进镜像（确实要带上就写进 PACK_KEEP）: ${rel}" >&2 ;;
+    esac
+  done <<<"$DROPPED"
+fi
 # 排除源码树里的预编译产物（.so/.pyd/.pyc）：它们应在 builder 阶段由 .py 重新编译。
 # 源树里的旧 .so 会被原样带进镜像，可能残留已从 .py 删除的旧密钥（这个坑踩过，见教程）。
+# rsync 按顺序取第一条匹配的规则，所以 PACK_KEEP 要排在所有排除规则前面。
 rsync -a \
+  ${KEEP_ARGS[@]+"${KEEP_ARGS[@]}"} \
+  "${KILN_SENSITIVE_RSYNC_ARGS[@]}" \
   --exclude='.git' \
   --exclude='.git/***' \
   --exclude='evidence/***' \
@@ -245,6 +288,8 @@ if [ "$PROFILE" = train ]; then
 fi
 # 公共：编译保护助手（builder 阶段用）
 cp "${ENGINE_DIR}/compile_protect.py" "${BUILD_CTX}/.kiln/compile_protect.py"
+# 公共：容器的 PID 1（把停止信号转给作业）
+cp "${ENGINE_DIR}/kiln_init.py" "${BUILD_CTX}/.kiln/kiln_init.py"
 # profile 专属：启动入口 +（serve 才有的）健康检查入口
 cp "${PROFILE_DIR}/launch.sh" "${BUILD_CTX}/.kiln/launch.sh"
 if [ -f "${PROFILE_DIR}/healthcheck.sh" ]; then
