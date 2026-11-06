@@ -101,8 +101,9 @@ BUILDER_BASE="my-torch-base"
 SRC_DIR="."
 PROTECT_GLOBS="trainer/recipe.py"  # 只保护 IP 模块，入口 train.py 留明文
 PIP_REQUIREMENTS="requirements.txt"
-LAUNCHER="single"                  # single | torchrun（deepspeed/accelerate 预留）
-NPROC_PER_NODE="1"                 # torchrun 单机进程数
+LAUNCHER="single"                  # single | torchrun | deepspeed | accelerate
+NPROC_PER_NODE="1"                 # 启动器的单机进程数
+# TORCHRUN_ARGS / DEEPSPEED_ARGS / ACCELERATE_ARGS：透传给对应启动器的额外参数
 OUTPUT_DIR="/workspace/output"     # 容器内产物目录，运行时挂卷取回
 CKPT_GLOB="*.pt"                   # 验收期望落下的 checkpoint
 START_CMD="python -m trainer.train --steps 50"
@@ -110,6 +111,18 @@ SECRET_MARKER="CHANGE_ME_UNIQUE_MARKER"
 REQUIRED_ENV="KILN_SECRET_MARKER"
 VERIFY_ENV="KILN_SECRET_MARKER=whatever-for-verify"
 CONFIG_ENCRYPT="off"               # on 时加密配置，见下一步
+```
+
+用 `deepspeed` 或 `accelerate` 时，把它们加进项目的 `requirements.txt`，没装会在起训时报错。
+
+- `deepspeed` 默认按 GPU 数起进程，也会给脚本加 `--local_rank` 参数，脚本不接受时要带 `--no_local_rank`。
+  没有 GPU 时用 `DEEPSPEED_ARGS="--hostfile=hostfile --no_ssh_check --master_addr=127.0.0.1 --no_local_rank"`
+  （`hostfile` 放在源码目录，内容如 `localhost slots=2`；镜像里没有 `ssh`，单机要跳过它的连通检查）。
+- `accelerate` 带 `--cpu` 时只起一个进程，会忽略 `--num_processes`。没有 GPU 又要多进程时用 `ACCELERATE_ARGS="--multi_gpu"`。
+
+启动器退回单进程时作业照样能跑通，建议让验收检查进程数确实对得上：
+```bash
+VERIFY_LOG_CONTAINS="world_size=2"   # 作业日志里必须出现的内容，按项目实际打印的内容写
 ```
 
 ### 3.1 加密 YAML 配置（可选）
@@ -127,6 +140,14 @@ cfg = load_yaml("configs/recipe.yaml")   # 相对 /app 的路径
 - `load_yaml` 需要 PyYAML，把它加进项目的 `requirements.txt`；`cryptography` 由引擎自动安装。
 - 别在模块顶层读配置，builder 阶段的 import 自检拿不到密钥；放进函数里调用。
 - 别把配置内容打进日志或存进 checkpoint，这样明文就又出去了。
+
+框架只接受配置文件路径、改不了读取方式时，让启动脚本先把配置解密到内存盘（单引号不能省，变量要留到运行时才展开）：
+```bash
+CONFIG_MATERIALIZE="configs/recipe.yaml"
+START_CMD='python -m some_framework --config ${KILN_CONFIG_DIR}/configs/recipe.yaml'
+```
+这样作业期间明文在 `/dev/shm`，能进容器的人直接 `cat` 就能读到，所以默认关闭，能用 `load_yaml` 就别开。
+它只写内存盘（不是内存盘就拒绝启动），文件随容器消失，内存盘默认只有 64MB，配置很大时调 `--shm-size`。
 
 密钥不写进 `pack.conf`，打包和运行都用环境变量：
 ```bash

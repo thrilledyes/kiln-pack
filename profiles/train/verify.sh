@@ -89,7 +89,11 @@ RUN_LOG="$(mktemp)"
 docker run --rm ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} -v "$HOST_OUT:$OUTPUT_DIR" "$TAG" 2>&1 | tee "$RUN_LOG"
 RC="${PIPESTATUS[0]}"
 echo "    作业退出码: $RC"
-if [ "$RC" -eq 0 ]; then ok "训练作业正常退出（码 0）"; else bad "训练作业异常退出（码 $RC）"; fi
+if [ "$RC" -eq 0 ]; then ok "训练作业正常退出（码 0）"; else bad "训练作业异常退出（码 ${RC}）"; fi
+# 可选：日志里必须出现的内容。比如 world_size=2，防止启动器悄悄退回单进程，作业照样跑通、验收照样过。
+if [[ -n "${VERIFY_LOG_CONTAINS:-}" ]]; then
+  if grep -qF -e "$VERIFY_LOG_CONTAINS" "$RUN_LOG"; then ok "日志里有 ${VERIFY_LOG_CONTAINS}"; else bad "日志里没有 ${VERIFY_LOG_CONTAINS}"; fi
+fi
 
 # checkpoint 是否落盘
 CKPTS="$(cd "$HOST_OUT" 2>/dev/null && ls -1 $CKPT_GLOB 2>/dev/null)"

@@ -37,28 +37,55 @@ if [ ! -w "${OUTPUT_DIR}" ]; then
   exit 1
 fi
 
+# 框架只接受配置文件路径时，把 CONFIG_MATERIALIZE 列的配置解密到内存盘，START_CMD 用
+# ${KILN_CONFIG_DIR}/<相对路径> 引用。在启动器之前做，多进程读的是同一份；文件随容器一起消失。
+if [ -n "${CONFIG_MATERIALIZE}" ]; then
+  # shellcheck disable=SC2086
+  KILN_CONFIG_DIR="$(python -m kiln_config materialize ${CONFIG_MATERIALIZE})"
+  export KILN_CONFIG_DIR
+  echo "[kiln] 配置已解密到内存盘: ${KILN_CONFIG_DIR}（作业期间能进容器的人可以读到明文）"
+fi
+
 # 训练命令（渲染自 pack.conf 的 START_CMD），例如: python -m trainer.train --steps 50
 START_CMD="$(cat /app/.kiln/start_cmd.sh)"
 
+# 启动器自己会拉起 python：去掉 START_CMD 开头的 python/python3，把剩下的「-m 模块 ...」或「脚本 ...」交给它。
+strip_python() {
+  printf '%s\n' "${START_CMD}" | sed -E 's/^[[:space:]]*python3?[[:space:]]+//'
+}
+
+# 启动器由项目在 requirements 里安装，没装时给出明确报错。
+require_launcher() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "[kiln] LAUNCHER='${LAUNCHER}' 需要命令 $1，请把 $2 加进项目的 requirements。" >&2
+    exit 2
+  fi
+}
+
+# 启动命令都交给 sh -c，这样 START_CMD 里的引号和 ${KILN_CONFIG_DIR} 在各个启动器下行为一致。
 case "${LAUNCHER}" in
   single)
-    echo "[kiln] 起训: ${START_CMD}"
-    exec /bin/sh -c "${START_CMD}"
+    RUN_CMD="${START_CMD}"
     ;;
   torchrun)
-    # torchrun 本身就是启动器，内部会拉起 python；去掉 START_CMD 开头的 python/python3，
-    # 把剩下的「-m 模块 ...」或「脚本 ...」交给它。单机多卡用 --standalone 自带 rendezvous。
-    CMD_BODY="$(printf '%s\n' "${START_CMD}" | sed -E 's/^[[:space:]]*python3?[[:space:]]+//')"
-    echo "[kiln] 起训: torchrun --standalone --nproc_per_node=${NPROC_PER_NODE} ${TORCHRUN_ARGS} ${CMD_BODY}"
-    # shellcheck disable=SC2086
-    exec torchrun --standalone --nproc_per_node="${NPROC_PER_NODE}" ${TORCHRUN_ARGS} ${CMD_BODY}
+    # 单机多卡用 --standalone 自带 rendezvous。
+    require_launcher torchrun torch
+    RUN_CMD="torchrun --standalone --nproc_per_node=${NPROC_PER_NODE} ${TORCHRUN_ARGS} $(strip_python)"
     ;;
-  deepspeed|accelerate)
-    echo "[kiln] LAUNCHER='${LAUNCHER}' 在 v1 尚未实装（预留）。当前支持: single | torchrun。" >&2
-    exit 2
+  deepspeed)
+    # deepspeed 用 --module 而不是 -m。它默认按 GPU 数起进程，没有 GPU 时要在 DEEPSPEED_ARGS 里给 --hostfile。
+    require_launcher deepspeed deepspeed
+    RUN_CMD="deepspeed --num_gpus=${NPROC_PER_NODE} ${DEEPSPEED_ARGS} $(strip_python | sed -E 's/^-m[[:space:]]+/--module /')"
+    ;;
+  accelerate)
+    require_launcher accelerate accelerate
+    RUN_CMD="accelerate launch --num_processes=${NPROC_PER_NODE} ${ACCELERATE_ARGS} $(strip_python)"
     ;;
   *)
-    echo "[kiln] 未知 LAUNCHER='${LAUNCHER}'。支持: single | torchrun（deepspeed/accelerate 预留）。" >&2
+    echo "[kiln] 未知 LAUNCHER='${LAUNCHER}'。支持: single | torchrun | deepspeed | accelerate。" >&2
     exit 2
     ;;
 esac
+
+echo "[kiln] 起训: ${RUN_CMD}"
+exec /bin/sh -c "${RUN_CMD}"
