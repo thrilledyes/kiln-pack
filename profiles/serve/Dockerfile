@@ -1,6 +1,7 @@
-# syntax=docker/dockerfile:1
 # SPDX-License-Identifier: Apache-2.0
 # 通用两阶段打包 Dockerfile（由 pack.sh 调用，一般不用手改）。
+# 刻意不写 `# syntax=docker/dockerfile:1`：那会让每次构建都去 docker.io 拉外部 frontend，
+# 在受限/离线网络下易失败；本 Dockerfile 只用经典指令，docker 内置解析器即可，构建更鲁棒。
 #   builder  阶段：装编译器 + Cython，把受保护的 .py 编译成 .so，删掉明文源码。
 #   runtime  阶段：干净底座，只拷贝“已去源码”的应用目录 + 装运行期依赖。
 # 编译器、Cython、.c 中间产物都留在 builder 阶段，不进最终镜像。
