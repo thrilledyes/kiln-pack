@@ -21,8 +21,9 @@ FAIL=0
 ok()   { echo "  [PASS] $*"; }
 bad()  { echo "  [FAIL] $*"; FAIL=1; }
 
-HOST_OUT=""; EXPORT_DIR=""
-cleanup() { [ -n "$HOST_OUT" ] && rm -rf "$HOST_OUT"; [ -n "$EXPORT_DIR" ] && rm -rf "$EXPORT_DIR"; }
+# 产物挂载目录和作业日志都是临时文件，脚本中途失败也要清掉（踩过：日志漏在 $TMPDIR）。
+HOST_OUT=""; RUN_LOG=""
+cleanup() { rm -rf "${HOST_OUT:-/nonexistent-kiln}" "${RUN_LOG:-/nonexistent-kiln}"; }
 trap cleanup EXIT
 
 echo "== 1. 镜像里的文件 =="
