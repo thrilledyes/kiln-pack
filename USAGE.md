@@ -179,6 +179,19 @@ docker run --rm \
 
 ---
 
+## 依赖安装加固（可选，serve 和 train 都能用）
+
+项目的依赖由 `PIP_REQUIREMENTS` 指定，默认按 pip 的常规方式安装。要锁定哈希或禁止执行安装脚本，在 `pack.conf` 里加：
+
+```bash
+PIP_INSTALL_ARGS="--require-hashes --only-binary :all:"
+```
+
+- `--require-hashes`：requirements 里每个包（包括间接依赖）都要写版本和哈希，可以用 `pip-compile --generate-hashes` 生成。
+- `--only-binary :all:`：只装 wheel，不执行源码包的安装脚本；没有 wheel 的依赖会装不上，打包直接失败。
+- 这个开关只作用于项目的 requirements。打包器自己装的 `Cython` 和 `cryptography` 不受影响，也没有锁定版本。
+- 它的值会留在镜像历史里，所以写了账号密码的索引地址会被拒绝。
+
 ## 边界（务必知道）
 
 - 保护的是**代码逻辑**，不是字符串常量：敏感值一律走 `REQUIRED_ENV` 外置。

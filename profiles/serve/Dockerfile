@@ -13,6 +13,7 @@ ARG RUNTIME_BASE=python:3.11-slim-bookworm
 FROM ${BUILDER_BASE} AS builder
 ARG PROTECT_GLOBS=""
 ARG PIP_REQUIREMENTS=""
+ARG PIP_INSTALL_ARGS=""
 RUN set -eux; \
     if command -v apt-get >/dev/null 2>&1; then \
       apt-get update; \
@@ -29,7 +30,7 @@ RUN rm -rf /src/.git /src/.gitignore && find /src -name '__pycache__' -type d -p
 # 这些依赖只留在 builder 阶段，不会进最终 runtime 镜像。
 RUN set -eux; \
     if [ -n "${PIP_REQUIREMENTS}" ] && [ -f "/src/${PIP_REQUIREMENTS}" ]; then \
-      pip install --no-cache-dir -r "/src/${PIP_REQUIREMENTS}"; \
+      pip install --no-cache-dir ${PIP_INSTALL_ARGS} -r "/src/${PIP_REQUIREMENTS}"; \
     fi
 # 编译受保护源码 → .so，并删除对应 .py / .c
 RUN python /src/.kiln/compile_protect.py /src ${PROTECT_GLOBS}
@@ -43,6 +44,7 @@ ARG KILN_VERSION=dev
 ARG KILN_BUILD_ID=unknown
 ARG KILN_BUILT_AT=unknown
 ARG PIP_REQUIREMENTS=""
+ARG PIP_INSTALL_ARGS=""
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     KILN_APP=${KILN_APP} \
@@ -59,7 +61,7 @@ RUN find /app -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null |
 # 运行期依赖（纯 wheel，无需编译器）
 RUN set -eux; \
     if [ -n "${PIP_REQUIREMENTS}" ] && [ -f "/app/${PIP_REQUIREMENTS}" ]; then \
-      pip install --no-cache-dir -r "/app/${PIP_REQUIREMENTS}"; \
+      pip install --no-cache-dir ${PIP_INSTALL_ARGS} -r "/app/${PIP_REQUIREMENTS}"; \
     fi
 # 非 root 运行：抬高同容器内 ptrace / 读 /proc/<pid>/mem 等攻击的门槛。
 # 依赖已在上面以 root 装好，运行期只读执行 /app，不需要写权限。

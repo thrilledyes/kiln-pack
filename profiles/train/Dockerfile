@@ -19,6 +19,7 @@ ARG RUNTIME_BASE=python:3.11-slim-bookworm
 FROM ${BUILDER_BASE} AS builder
 ARG PROTECT_GLOBS=""
 ARG PIP_REQUIREMENTS=""
+ARG PIP_INSTALL_ARGS=""
 RUN set -eux; \
     if command -v apt-get >/dev/null 2>&1; then \
       apt-get update; \
@@ -29,7 +30,7 @@ RUN pip install --no-cache-dir Cython
 COPY .kiln/pip-requirements.txt /tmp/kiln-requirements.txt
 RUN set -eux; \
     if [ -s /tmp/kiln-requirements.txt ]; then \
-      pip install --no-cache-dir -r /tmp/kiln-requirements.txt; \
+      pip install --no-cache-dir ${PIP_INSTALL_ARGS} -r /tmp/kiln-requirements.txt; \
     fi; \
     rm -f /tmp/kiln-requirements.txt
 WORKDIR /src
@@ -42,7 +43,7 @@ RUN rm -rf /src/.git /src/.gitignore && find /src -name '__pycache__' -type d -p
 # 上面提前装过时这一步什么都不用做；requirements 里有相对路径时靠这一步来装。
 RUN set -eux; \
     if [ -n "${PIP_REQUIREMENTS}" ] && [ -f "/src/${PIP_REQUIREMENTS}" ]; then \
-      pip install --no-cache-dir -r "/src/${PIP_REQUIREMENTS}"; \
+      pip install --no-cache-dir ${PIP_INSTALL_ARGS} -r "/src/${PIP_REQUIREMENTS}"; \
     fi
 # 受保护模块可能 import kiln_config，import 自检时要能找到它。
 ENV PYTHONPATH=/src/.kiln/lib${PYTHONPATH:+:${PYTHONPATH}}
@@ -55,10 +56,11 @@ RUN rm -f /src/.kiln/compile_protect.py /src/.kiln/pip-requirements.txt
 FROM ${RUNTIME_BASE} AS runtime
 # 必须排在 KILN_BUILD_ID 之前：它每次构建都变，后面的 RUN 都会隐式带上它，缓存全部失效。
 ARG CONFIG_ENCRYPT=off
+ARG PIP_INSTALL_ARGS=""
 COPY .kiln/pip-requirements.txt /tmp/kiln-requirements.txt
 RUN set -eux; \
     if [ -s /tmp/kiln-requirements.txt ]; then \
-      pip install --no-cache-dir -r /tmp/kiln-requirements.txt; \
+      pip install --no-cache-dir ${PIP_INSTALL_ARGS} -r /tmp/kiln-requirements.txt; \
     fi; \
     rm -f /tmp/kiln-requirements.txt
 # 运行时解密配置要用
@@ -95,7 +97,7 @@ RUN find /app -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null |
 # requirements 里有相对路径时靠这一步来装。
 RUN set -eux; \
     if [ -n "${PIP_REQUIREMENTS}" ] && [ -f "/app/${PIP_REQUIREMENTS}" ]; then \
-      pip install --no-cache-dir -r "/app/${PIP_REQUIREMENTS}"; \
+      pip install --no-cache-dir ${PIP_INSTALL_ARGS} -r "/app/${PIP_REQUIREMENTS}"; \
     fi
 # 非 root 运行：抬高同容器内 ptrace / 读 /proc/<pid>/mem 等攻击门槛。
 # 代码 /app 仍只读（a+rX，不给写）；训练需要写的只有产物目录和框架缓存，

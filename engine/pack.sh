@@ -53,6 +53,16 @@ fi
 
 PROTECT_GLOBS="${PROTECT_GLOBS:-}"
 PIP_REQUIREMENTS="${PIP_REQUIREMENTS:-}"
+# 透传给 pip install -r 的额外参数，默认空。比如 --require-hashes、--only-binary :all:。
+PIP_INSTALL_ARGS="${PIP_INSTALL_ARGS:-}"
+# 这个值走 --build-arg，会留在镜像历史里，所以带账号密码的索引地址不能写在这里。
+case "$PIP_INSTALL_ARGS" in
+  *://*@*)
+    echo "!! PIP_INSTALL_ARGS 不能带账号密码（它会留在镜像历史里），请改用 pip.conf 或 secret 挂载。" >&2
+    exit 2
+    ;;
+  *) ;;
+esac
 EXPOSE_PORT="${EXPOSE_PORT:-8000}"
 HEALTHCHECK_CMD="${HEALTHCHECK_CMD:-true}"
 SECRET_MARKER="${SECRET_MARKER:-}"
@@ -271,6 +281,7 @@ BUILD_ARGS=(
   --build-arg RUNTIME_BASE="$RUNTIME_BASE"
   --build-arg PROTECT_GLOBS="$(echo "$PROTECT_GLOBS" | tr '\n' ' ')"
   --build-arg PIP_REQUIREMENTS="$PIP_REQUIREMENTS"
+  --build-arg PIP_INSTALL_ARGS="$PIP_INSTALL_ARGS"
   --build-arg KILN_APP="$APP_NAME"
   --build-arg KILN_VERSION="$VERSION"
   --build-arg KILN_BUILD_ID="$BUILD_ID"

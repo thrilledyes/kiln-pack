@@ -74,6 +74,8 @@ bash engine/pack.sh tests/demo-train
   验收只能靠 `CONFIG_MARKER` 抽查这一段特征字符串。
 - 框架只接受配置文件路径时可以开 `CONFIG_MATERIALIZE`，代价是作业期间明文在内存盘 `/dev/shm`，
   能进容器的人直接 `cat` 就能读到，比只在进程内存里更容易拿。只写内存盘，不落磁盘，文件随容器消失。能用 `kiln_config` 读就别开。
+- 依赖默认按 pip 常规方式安装，不锁哈希，源码包的安装脚本会在构建时执行。需要加固时用 `PIP_INSTALL_ARGS` 开启，
+  它只作用于项目的 requirements，打包器自己装的 `Cython`、`cryptography` 不受影响。见 USAGE「依赖安装加固」。
 - **与 `torch.compile` 的张力**：dynamo 追踪 Python 字节码，编成 `.so` 的模块它无法追踪，会 graph-break 退回 eager。
   最想保护的热点逻辑和最想被 compile 优化的往往是同一块，需按场景二选一。
 - `.so` 认平台和 Python 版本：builder 与 runtime 的架构、Python 版本必须一致。
