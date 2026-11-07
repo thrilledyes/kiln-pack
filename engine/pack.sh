@@ -67,6 +67,17 @@ if [[ ! "$EXPOSE_PORT" =~ ^[0-9]+$ ]]; then
   echo "!! EXPOSE_PORT 必须是端口号（当前 ${EXPOSE_PORT}）。" >&2
   exit 2
 fi
+# 运行用户的 uid/gid。挂载的模型或数据目录只有某个用户读得到时，改成那个 uid。不允许 root。
+RUNTIME_UID="${RUNTIME_UID:-10001}"
+RUNTIME_GID="${RUNTIME_GID:-$RUNTIME_UID}"
+if [[ ! "$RUNTIME_UID" =~ ^[1-9][0-9]*$ || ! "$RUNTIME_GID" =~ ^[1-9][0-9]*$ ]]; then
+  echo "!! RUNTIME_UID / RUNTIME_GID 必须是正整数，不能用 root（当前 ${RUNTIME_UID}:${RUNTIME_GID}）。" >&2
+  exit 2
+fi
+if [[ "${VERIFY_LOSS:-on}" != on && "${VERIFY_LOSS:-on}" != off ]]; then
+  echo "!! 未知 VERIFY_LOSS='${VERIFY_LOSS}'。支持: on | off。" >&2
+  exit 2
+fi
 # 容器启动后这段时间内健康检查失败不算数。要加载模型的服务调大，比如 10m。
 HEALTH_START_PERIOD="${HEALTH_START_PERIOD:-20s}"
 if [[ ! "$HEALTH_START_PERIOD" =~ ^[0-9]+(s|m|h)$ ]]; then
@@ -305,8 +316,9 @@ if [ "$PROFILE" = train ]; then
 fi
 # 公共：编译保护助手（builder 阶段用）
 cp "${ENGINE_DIR}/compile_protect.py" "${BUILD_CTX}/.kiln/compile_protect.py"
-# 公共：容器的 PID 1（把停止信号转给作业）
+# 公共：容器的 PID 1（把停止信号转给作业），以及启动前的环境检查
 cp "${ENGINE_DIR}/kiln_init.py" "${BUILD_CTX}/.kiln/kiln_init.py"
+cp "${ENGINE_DIR}/runtime_env.sh" "${BUILD_CTX}/.kiln/runtime_env.sh"
 # profile 专属：启动入口 +（serve 才有的）健康检查入口
 cp "${PROFILE_DIR}/launch.sh" "${BUILD_CTX}/.kiln/launch.sh"
 if [ -f "${PROFILE_DIR}/healthcheck.sh" ]; then
@@ -352,6 +364,8 @@ BUILD_ARGS=(
   --build-arg KILN_VERSION="$VERSION"
   --build-arg KILN_BUILD_ID="$BUILD_ID"
   --build-arg KILN_BUILT_AT="$BUILT_AT"
+  --build-arg KILN_UID="$RUNTIME_UID"
+  --build-arg KILN_GID="$RUNTIME_GID"
 )
 # train runtime 需要一个可写产物目录；serve 的 Dockerfile 不声明该 arg，故仅 train 传。
 if [ "$PROFILE" = train ]; then

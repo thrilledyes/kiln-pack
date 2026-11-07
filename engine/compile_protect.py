@@ -14,8 +14,53 @@
 """
 import glob as globmod
 import os
+import re
 import subprocess
 import sys
+
+# START_CMD 里由 python 直接启动的目标：python [选项] -m 模块，或 python [选项] 脚本.py。
+ENTRY_PATTERN = re.compile(
+    r"(?:^|[\s;&|(])(?:\S*/)?python[0-9.]*\s+(?:-(?![mc]\b)\S+\s+)*"
+    r"(?:-m\s+(?P<module>[\w.]+)|(?P<script>[^\s;&|()\"']+\.py))(?=$|[\s;&|)])"
+)
+
+
+def protected_entries(start_cmd, protected_rels):
+    """返回 START_CMD 里用 python 直接启动、却会被编成 .so 的目标。
+
+    .so 里没有字节码，python -m 会报 No code object available；脚本的 .py 已经删了，也找不到文件。
+    import 自检查不出来，要到运行时才炸，所以打包时就拦下。
+    """
+    protected = {os.path.normpath(rel) for rel in protected_rels}
+    hits = []
+    for match in ENTRY_PATTERN.finditer(start_cmd):
+        module, script = match.group("module"), match.group("script")
+        if module:
+            path = module.replace(".", os.sep)
+            if {path + ".py", os.path.join(path, "__main__.py")} & protected:
+                hits.append(f"python -m {module}")
+        else:
+            path = os.path.normpath(script)
+            app_prefix = os.sep + "app" + os.sep
+            if path.startswith(app_prefix):
+                path = path[len(app_prefix):]
+            if path in protected:
+                hits.append(f"python {script}")
+    return hits
+
+
+def check_entries(root, targets):
+    start_cmd_file = os.path.join(root, ".kiln", "start_cmd.sh")
+    if not os.path.exists(start_cmd_file):
+        return
+    with open(start_cmd_file, encoding="utf-8") as f:
+        start_cmd = f.read()
+    hits = protected_entries(start_cmd, [os.path.relpath(t, root) for t in targets])
+    if hits:
+        print(f"!! START_CMD 不能直接启动受保护的模块: {', '.join(hits)}", file=sys.stderr)
+        print("!! 编成 .so 后没有字节码，这样启动会失败。入口留明文，或改成", file=sys.stderr)
+        print('!! python -c "from 模块 import main; main()"', file=sys.stderr)
+        sys.exit(6)
 
 
 def run(cmd):
@@ -46,6 +91,8 @@ def main():
     if not targets:
         print("没有需要编译的文件", file=sys.stderr)
         sys.exit(3)
+
+    check_entries(root, targets)
 
     # 逐个编译成 .so。--no-docstrings 连文档字符串一起去掉，减少可读信息。
     for f in targets:

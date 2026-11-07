@@ -196,6 +196,54 @@ docker run --rm \
 
 ---
 
+## 用真实框架底座打包（serve 和 train 都适用）
+
+框架镜像常常是非 root 用户、带 CUDA、放在离线服务器上，下面这些项目就是为它准备的。
+
+**底座和离线环境**
+
+- 底座是非 root 用户也可以，构建时会切到 root，最终镜像再切回 `appuser`。
+- 底座自带 gcc 和 `Python.h` 时不跑 `apt-get`，已装 Cython 时不再下载。**离线环境要把 Cython 预装进 `BUILDER_BASE`**，可以从有网的机器下载 wheel 再 `COPY` 进去。
+- 底座的内容都会留在最终镜像里：底座自带的编译器、框架源码和目录都还在，验收也不扫它们。
+
+**验收用到 GPU 和模型**
+
+```bash
+VERIFY_DOCKER_ARGS='--gpus "device=2,3" -v /data/models/m:/models/m:ro'   # 按空格拆开，传给验收时的 docker run
+```
+
+指定多张卡时，`device=2,3` 外面的双引号不能省。写成 `--gpus device=2,3` 会报 `cannot set both Count and DeviceIDs`，逗号被 Docker 当成了分隔符。
+
+**模型目录读不了**
+
+容器默认以 uid 10001 运行。挂载的目录只有某个用户读得到时，有两种办法：
+
+```bash
+RUNTIME_UID="1036"   # 打包时指定运行用户，RUNTIME_GID 默认和它相同，不能用 root
+```
+
+或者运行时用 `docker run --user 1036:1036`。后者也可以，这时产物目录要挂载到一个这个 uid 写得了的地方。
+
+**缓存目录**
+
+启动时会检查 `HF_HOME`、`HF_HUB_CACHE`、`HF_DATASETS_CACHE`、`TRANSFORMERS_CACHE`、`MODELSCOPE_CACHE`、`TORCH_HOME`、`XDG_CACHE_HOME`、`TORCH_EXTENSIONS_DIR`、`TRITON_CACHE_DIR`，写不了的改到 `HOME` 下，并在日志里说明。写得了的不动。底座里预置了只读缓存、又确实要用时，运行时设 `KILN_KEEP_CACHE_ENV=1` 跳过这一步。
+
+**入口不能是受保护的模块**
+
+`python -m 受保护模块` 和 `python 受保护脚本.py` 跑不起来（`No code object available`），打包时就会报错。入口留明文，或者写成 `python -c "from 模块 import main; main()"`。
+
+**真实训练的验收（train）**
+
+验收默认把 `START_CMD` 完整跑一遍，真实训练跑不完。可以换成短任务，它只通过环境变量传给验收时的容器，不写进镜像：
+
+```bash
+VERIFY_START_CMD='python -m trainer.train --steps 20'
+LOSS_TAG="'loss': "    # 日志里 loss 的前缀，数值带不带引号都认得
+VERIFY_LOSS="off"      # loss 抖动、短任务不一定下降时可以关掉，默认 on，关了会警告
+```
+
+短任务也要读加密配置，不然「错误密钥时要失败」这项检查过不了。
+
 ## 敏感文件（serve 和 train 都生效）
 
 这些文件默认不进镜像，打包时会逐个提示：

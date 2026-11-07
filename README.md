@@ -19,6 +19,7 @@ engine/   公共引擎（与交付形态无关）
   kiln_init.py         容器的 PID 1：把 docker stop 的信号转给作业，传回退出码
   sensitive.sh         敏感文件和地址凭据的规则：打包时排除或拒绝，验收时发现就判失败
   verify_lib.sh        两个 profile 的验收脚本共用的检查
+  runtime_env.sh       容器启动前的环境检查：底座的缓存目录写不了就改到 HOME 下
 
 profiles/ 两种交付形态，各自的 Dockerfile + 启动/验收脚本
   serve/   常驻服务：Dockerfile（非 root 只读）/ launch.sh / healthcheck.sh / verify.sh
@@ -30,7 +31,9 @@ tests/    测试环境（独立于引擎）
   test_kiln_config.py  配置加密的单元测试
   test_kiln_init.py    信号转发的单元测试
   test_sensitive.py    敏感文件规则的单元测试
+  test_compile_protect.py  START_CMD 启动受保护模块的判断
   acceptance.sh        需要 Docker 的端到端验收，覆盖敏感文件、验收假结果、接口探针、停止信号和各启动器
+  acceptance_gpu.sh    真实 GPU 上的端到端验收：多卡训练、真实模型推理、真实训练框架
 ```
 
 ## 用法
@@ -61,14 +64,18 @@ bash engine/pack.sh tests/demo-train
   明文和密钥都不经过 `docker build`，不进任何镜像层和构建缓存。运行时注入 `KILN_CONFIG_KEY`，代码用
   `kiln_config.load_yaml()` 在内存里解密。开启后验收会逐层扫描镜像，并确认没有密钥或密钥不对时起不了训。
 - **GPU**：demo 用 CPU torch 跑通流程（无卡环境即可验收）。真实训练把 `RUNTIME_BASE`/`BUILDER_BASE`
-  换成带 CUDA/ROCm/CANN 的框架镜像，运行时加 `--gpus`，`init_process_group` 换 `nccl`/`hccl`。
+  换成带 CUDA/ROCm/CANN 的框架镜像，用 `VERIFY_DOCKER_ARGS` 给验收传 `--gpus`，`init_process_group` 换 `nccl`/`hccl`。
+  非 root 底座、离线环境和权限严的模型目录见 USAGE「用真实框架底座打包」。
 
 ## 通用性
 
-- **serve** 的端到端验收目前只覆盖 `demo-fastapi` 和一个接口不同的标准库小服务（见 `tests/acceptance.sh`）。
-  早期做过 vLLM / SGLang 的打包试验，但仓库里没有对应的配置和验收记录，接口探针改成可配置之后也没有重跑，不能算验证过。
-- **train** 目前以 CPU torch demo 验证了完整链路（编译保护 → 起训 → 冒烟验收）；真实 GPU/CANN 框架的打包待在有卡环境验证。
-  `torchrun` / `deepspeed` / `accelerate` 都在 CPU 上验证过能拉起两个进程并跑完，但 demo 没有调用 `deepspeed.initialize` 和 `Accelerator`，它们和编译保护、真实 GPU 的配合还没验证。
+已在 x86_64 + NVIDIA A30 + 带 CUDA torch 的非 root 底座、离线服务器上实测（`tests/acceptance_gpu.sh`）：
+
+- **serve**：加载真实模型的 FastAPI 服务，路由和 pydantic 模型编成 `.so` 后正常工作。
+  vLLM / SGLang 早期做过打包试验，但仓库里没有对应的配置和验收记录，也没有在这套流程上重跑，不能算验证过。
+- **train**：`torchrun` 两卡 nccl、`Accelerator` 两卡混合精度、LlamaFactory 只认配置路径的 LoRA 训练，都配合编译保护和配置加密跑通了。
+  `deepspeed` 只在 CPU 上验证过能拉起两个进程，`deepspeed.initialize` 和真实 GPU 的配合还没验证（在没有 `nvcc` 的底座上，它的安装就会失败）。
+- **还没验证**：昇腾 / CANN、其他厂商的卡、跨节点训练。
 
 ## 边界
 

@@ -92,7 +92,9 @@ echo "== 5. 起服 + 健康检查 + 接口探针 =="
 # 敏感 env 由验收侧注入（真实部署由运维提供，不随镜像发出）；缺了 launch.sh 会拒绝起服。
 ENV_ARGS=()
 for kv in ${VERIFY_ENV:-}; do ENV_ARGS+=(-e "$kv"); done
-docker run -d --name "$CNAME" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} -p "$PORT:${EXPOSE_PORT:-8000}" "$TAG" >/dev/null
+# VERIFY_DOCKER_ARGS：验收时多传给 docker run 的参数，比如 --gpus、模型目录的 -v。
+# shellcheck disable=SC2086
+docker run -d --name "$CNAME" ${VERIFY_DOCKER_ARGS:-} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} -p "$PORT:${EXPOSE_PORT:-8000}" "$TAG" >/dev/null
 # 每个框架的接口都不一样，这里不写死端点：健康检查用项目的 HEALTHCHECK_CMD（和镜像里的 HEALTHCHECK 同一条，
 # 在容器内执行），接口探针用项目的 VERIFY_CMD（在打包机上执行）。
 if [[ "${HEALTHCHECK_CMD:-true}" == true ]]; then
@@ -114,10 +116,10 @@ if [[ "$HEALTHY" -eq 1 ]]; then
   ok "健康检查通过（等了 ${SECONDS} 秒）"
 elif [[ "$(docker inspect -f '{{.State.Running}}' "$CNAME" 2>/dev/null)" != true ]]; then
   bad "服务提前退出（码 $(docker inspect -f '{{.State.ExitCode}}' "$CNAME" 2>/dev/null)）"
-  docker logs "$CNAME" 2>&1 | tail -20
+  kiln_show_failure_log "$CNAME"
 else
   bad "${VERIFY_TIMEOUT} 秒内健康检查没有通过（模型加载慢的服务可以调大 VERIFY_TIMEOUT）"
-  docker logs "$CNAME" 2>&1 | tail -20
+  kiln_show_failure_log "$CNAME"
 fi
 if [[ -z "${VERIFY_CMD:-}" ]]; then
   echo "  [WARN] 没设 VERIFY_CMD，只确认了服务健康，没有验证接口和受保护逻辑。"

@@ -31,6 +31,11 @@ HOST_OUT=""; RUN_LOG=""; SCAN_DIR=""
 STOP_NAME="kiln-verify-stop-$$"
 cleanup() {
   docker rm -fv "$STOP_NAME" >/dev/null 2>&1 || true
+  # 作业以容器用户写的子目录，打包机上的用户删不掉，先用 root 在容器里清掉。
+  if [[ -n "$HOST_OUT" && -d "$HOST_OUT" ]]; then
+    docker run --rm --user 0 --network none --entrypoint /bin/sh -v "$HOST_OUT:/kiln-out" "$TAG" \
+      -c 'rm -rf /kiln-out/* /kiln-out/.[!.]*' >/dev/null 2>&1 || true
+  fi
   rm -rf "${HOST_OUT:-/nonexistent-kiln}" "${RUN_LOG:-/nonexistent-kiln}" "${SCAN_DIR:-/nonexistent-kiln}"
 }
 trap cleanup EXIT
@@ -92,11 +97,19 @@ for kv in ${VERIFY_ENV:-}; do ENV_ARGS+=(-e "$kv"); done
 # 配置密钥只按名字传给 docker，不写进命令行。
 KEY_ARGS=()
 [ "${CONFIG_ENCRYPT:-off}" = on ] && KEY_ARGS=(-e KILN_CONFIG_KEY)
-# 产物挂载到宿主临时目录；非 root 容器（uid 10001）要能写，放开 others 写位。
+# VERIFY_START_CMD：验收时跑的短任务，真实训练跑不完一次冒烟。只通过环境变量传给容器，不写进镜像。
+SMOKE_ARGS=()
+if [[ -n "${VERIFY_START_CMD:-}" ]]; then
+  SMOKE_ARGS=(-e "KILN_VERIFY_START_CMD=${VERIFY_START_CMD}")
+  echo "    验收用短任务: ${VERIFY_START_CMD}"
+fi
+# 产物挂载到宿主临时目录；非 root 容器要能写，放开 others 写位。
 HOST_OUT="$(mktemp -d)"; chmod 777 "$HOST_OUT"
 echo "    产物挂载: $HOST_OUT -> $OUTPUT_DIR"
 RUN_LOG="$(mktemp)"
-docker run --rm ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} -v "$HOST_OUT:$OUTPUT_DIR" "$TAG" 2>&1 | tee "$RUN_LOG"
+# VERIFY_DOCKER_ARGS：验收时多传给 docker run 的参数，比如 --gpus、模型或数据目录的 -v。
+# shellcheck disable=SC2086
+docker run --rm ${VERIFY_DOCKER_ARGS:-} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} ${SMOKE_ARGS[@]+"${SMOKE_ARGS[@]}"} -v "$HOST_OUT:$OUTPUT_DIR" "$TAG" 2>&1 | tee "$RUN_LOG"
 RC="${PIPESTATUS[0]}"
 echo "    作业退出码: $RC"
 if [ "$RC" -eq 0 ]; then ok "训练作业正常退出（码 0）"; else bad "训练作业异常退出（码 ${RC}）"; fi
@@ -109,9 +122,12 @@ fi
 CKPTS="$(cd "$HOST_OUT" 2>/dev/null && ls -1 $CKPT_GLOB 2>/dev/null)"
 if [ -n "$CKPTS" ]; then ok "产物目录落下 checkpoint: $(echo "$CKPTS" | tr '\n' ' ')"; else bad "产物目录没有匹配 '$CKPT_GLOB' 的 checkpoint"; fi
 
-# loss 趋势：抓日志里所有 loss=数值，判首末有限且不升
-LOSSES="$(grep -oE "${LOSS_TAG}[-+0-9.eEnafiNAFI]+" "$RUN_LOG" | sed "s/${LOSS_TAG}//" )"
-if [ -n "$LOSSES" ]; then
+# loss 趋势：抓日志里所有 loss=数值，判首末有限且不升。数值可以带引号（transformers 5 打印 {'loss': '1.23'}）。
+# 真实训练的 loss 会抖动，短任务不一定下降，可以用 VERIFY_LOSS="off" 关掉这项。
+LOSSES="$(grep -oE "${LOSS_TAG}['\"]?[-+0-9.eEnafiNAFI]+" "$RUN_LOG" | sed "s/${LOSS_TAG}//; s/^['\"]//" )"
+if [[ "${VERIFY_LOSS:-on}" == off ]]; then
+  echo "  [WARN] VERIFY_LOSS=off，跳过 loss 检查，这一项没有验证过。"
+elif [ -n "$LOSSES" ]; then
   FIRST_L="$(echo "$LOSSES" | head -n1)"; LAST_L="$(echo "$LOSSES" | tail -n1)"
   echo "    loss first=${FIRST_L} last=${LAST_L}"
   # 变量一律用 ${} 包：避免后面紧贴多字节字符时被某些 bash 吞进变量名（踩过）。
@@ -153,7 +169,8 @@ $CONFIG_LIST
 KILN_CONFIG_EOF
 
   # 缺密钥：launch.sh 应在起训前拒绝。
-  NOKEY_LOG="$(docker run --rm ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} "$TAG" 2>&1)"; NOKEY_RC=$?
+  # shellcheck disable=SC2086
+  NOKEY_LOG="$(docker run --rm ${VERIFY_DOCKER_ARGS:-} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} "$TAG" 2>&1)"; NOKEY_RC=$?
   if [ "$NOKEY_RC" -ne 0 ] && echo "$NOKEY_LOG" | grep -qF '缺少必需环境变量: KILN_CONFIG_KEY'; then
     ok "没有密钥时拒绝起训（码 ${NOKEY_RC}）"
   else
@@ -161,7 +178,8 @@ KILN_CONFIG_EOF
   fi
   # 错密钥：作业必须解密失败。如果还能跑通，说明作业根本没读加密配置。
   WRONG_KEY="$(head -c 32 /dev/urandom | base64)"
-  WRONG_LOG="$(docker run --rm ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} -e "KILN_CONFIG_KEY=${WRONG_KEY}" "$TAG" 2>&1)"; WRONG_RC=$?
+  # shellcheck disable=SC2086
+  WRONG_LOG="$(docker run --rm ${VERIFY_DOCKER_ARGS:-} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${SMOKE_ARGS[@]+"${SMOKE_ARGS[@]}"} -e "KILN_CONFIG_KEY=${WRONG_KEY}" -v "$HOST_OUT:$OUTPUT_DIR" "$TAG" 2>&1)"; WRONG_RC=$?
   if [ "$WRONG_RC" -ne 0 ] && echo "$WRONG_LOG" | grep -qF '解密失败'; then
     ok "错误密钥时解密失败，作业中止（码 ${WRONG_RC}）"
   elif [ "$WRONG_RC" -eq 0 ]; then
@@ -233,11 +251,13 @@ fi
 
 echo "== 8. 停止信号 =="
 # 被抢占或 docker stop 时作业要收得到 SIGTERM，否则来不及存 checkpoint。退出码 137 说明是被 SIGKILL 杀掉的。
-docker run -d --name "$STOP_NAME" ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} "$TAG" >/dev/null
+# shellcheck disable=SC2086
+docker run -d --name "$STOP_NAME" ${VERIFY_DOCKER_ARGS:-} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} ${SMOKE_ARGS[@]+"${SMOKE_ARGS[@]}"} -v "$HOST_OUT:$OUTPUT_DIR" "$TAG" >/dev/null
 SECONDS=0
 while [[ "$SECONDS" -lt 60 ]]; do
   STOP_LOG="$(docker logs "$STOP_NAME" 2>&1)"
-  if [[ "$STOP_LOG" == *'[kiln] 起训'* || "$(docker inspect -f '{{.State.Running}}' "$STOP_NAME" 2>/dev/null)" != true ]]; then
+  # 带冒号才算：拒绝起训的提示是「[kiln] 起训中止」。
+  if [[ "$STOP_LOG" == *'[kiln] 起训: '* || "$(docker inspect -f '{{.State.Running}}' "$STOP_NAME" 2>/dev/null)" != true ]]; then
     break
   fi
   sleep 1
@@ -250,8 +270,11 @@ if [[ "$(docker inspect -f '{{.State.Running}}' "$STOP_NAME" 2>/dev/null)" == tr
   else
     ok "docker stop 后作业正常退出（码 ${STOP_RC}）"
   fi
+elif [[ "$(docker logs "$STOP_NAME" 2>&1)" == *'[kiln] 起训: '* ]]; then
+  echo "  [i] 作业太短，在发出停止信号之前就结束了，这一项没有验证到。"
 else
-  echo "  [i] 作业在发出停止信号之前就结束了，这一项没有验证到。"
+  bad "作业没有起来，无法验证停止信号（码 $(docker inspect -f '{{.State.ExitCode}}' "$STOP_NAME" 2>/dev/null)）"
+  kiln_show_failure_log "$STOP_NAME"
 fi
 docker rm -fv "$STOP_NAME" >/dev/null 2>&1
 

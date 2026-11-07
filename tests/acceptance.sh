@@ -26,6 +26,8 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
+# 被中途结束时也要清理：bash 收到信号默认直接退出，不走 EXIT。
+trap 'exit 143' TERM INT
 
 passed() { PASSED=$((PASSED + 1)); echo "  [符合预期] $*"; }
 failed() {
@@ -112,12 +114,22 @@ expect_rejected() {
   fi
 }
 
-# pin_hashes <requirements 路径>：换成带完整哈希的版本。
+# pin_hashes <requirements 路径>：换成带完整哈希的版本。网络慢时 torch 这串依赖可能很久，限时 15 分钟。
+# 失败要明确报出来：拿空文件往下走，打包只会报不相干的错。
 pin_hashes() {
-  local file="$1"
-  docker run -i --rm python:3.11-slim-bookworm sh -c 'pip install -q --root-user-action=ignore pip-tools >/dev/null 2>&1; cat > /tmp/r.in; cd /tmp; pip-compile -q --generate-hashes --allow-unsafe --no-header --no-annotate --output-file=- r.in' \
-    < "$file" > "${file}.new" 2>/dev/null
+  local file="$1" name="kiln-acc-pin-$$" guard rc
+  ( sleep 900; docker rm -f "$name" ) >/dev/null 2>&1 &
+  guard=$!
+  docker run -i --rm --name "$name" python:3.11-slim-bookworm sh -c 'pip install -q --root-user-action=ignore pip-tools >/dev/null 2>&1; cat > /tmp/r.in; cd /tmp; pip-compile -q --generate-hashes --allow-unsafe --no-header --no-annotate --output-file=- r.in' \
+    < "$file" > "${file}.new" 2> "${file}.err"
+  rc=$?
+  kill "$guard" 2>/dev/null
+  if [[ "$rc" -ne 0 ]] || ! grep -q -- '--hash=' "${file}.new"; then
+    failed "生成哈希失败（码 ${rc}）: $(tail -1 "${file}.err" | cut -c1-160)"
+    return 1
+  fi
   mv "${file}.new" "$file"
+  rm -f "${file}.err"
 }
 
 # fetch_wheel <目录>：下载一个 wheel 到目录，模拟提前下载好的私有依赖。
@@ -681,16 +693,26 @@ scenario_pip_sdist_only() {
 }
 
 scenario_pip_full_hashes() {
-  new_project pip-hash-train demo-train
-  printf 'PIP_INSTALL_ARGS="--require-hashes --only-binary :all:"\n' >> "${WORK}/pip-hash-train/pack.conf"
-  pin_hashes "${WORK}/pip-hash-train/requirements.txt"
-  pack pip-hash-train
-  check_rc 0
   new_project pip-hash-serve demo-fastapi
   printf 'PIP_INSTALL_ARGS="--require-hashes --only-binary :all:"\n' >> "${WORK}/pip-hash-serve/pack.conf"
-  pin_hashes "${WORK}/pip-hash-serve/requirements.txt"
+  pin_hashes "${WORK}/pip-hash-serve/requirements.txt" || return
   pack pip-hash-serve
   check_rc 0
+  # train 这边 torch 预装在底座里：这里要验证的是每个 pip 步骤都带上参数，现场解析 torch 的全部依赖要很久。
+  printf 'FROM python:3.11-slim-bookworm\nRUN pip install --no-cache-dir torch==2.5.1 pyyaml==6.0.2\n' \
+    | docker build -q -t kiln-acc-torch-base:1 - >/dev/null
+  new_project pip-hash-train demo-train
+  cat >> "${WORK}/pip-hash-train/pack.conf" <<'EOF'
+PIP_INSTALL_ARGS="--require-hashes --only-binary :all:"
+RUNTIME_BASE="kiln-acc-torch-base:1"
+BUILDER_BASE="kiln-acc-torch-base:1"
+EOF
+  printf 'six==1.16.0\n' > "${WORK}/pip-hash-train/requirements.txt"
+  pin_hashes "${WORK}/pip-hash-train/requirements.txt" || return
+  pack pip-hash-train
+  check_rc 0
+  check_log 'pip install --no-cache-dir --require-hashes --only-binary :all: -r /tmp/kiln-requirements.txt'
+  check_log 'pip install --no-cache-dir --require-hashes --only-binary :all: -r /app/requirements.txt'
 }
 
 scenario_pip_args_credentials() {
@@ -815,7 +837,207 @@ HEALTH_START_PERIOD="10m/;s/x/"|HEALTH_START_PERIOD 要写成
 EOF
 }
 
+# ---------- 真实环境：非 root 底座、离线构建、权限和缓存 ----------
+# 框架镜像常见的样子：自带编译器和 Cython，默认用户不是 root，缓存变量指向底座用户的目录。
+build_framework_base() {
+  docker build -q -t "$1" - >/dev/null <<'EOF'
+FROM python:3.11-slim-bookworm
+RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev binutils && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir Cython
+RUN useradd -u 1000 -m trainer && mkdir -p /workspace/runtime && chown trainer /workspace/runtime
+ENV HF_DATASETS_CACHE=/opt/not-writable/datasets MODELSCOPE_CACHE=/opt/not-writable/modelscope HF_HUB_CACHE=/tmp/kiln-acc-writable-hub
+USER trainer
+EOF
+}
+
+scenario_nonroot_base_offline() {
+  build_framework_base kiln-acc-fw-base:1
+  new_service fw-offline
+  cat >> "${WORK}/fw-offline/pack.conf" <<'EOF'
+RUNTIME_BASE="kiln-acc-fw-base:1"
+BUILDER_BASE="kiln-acc-fw-base:1"
+EOF
+  echo "    打包 fw-offline（构建时断网）"
+  bash "${ROOT}/engine/pack.sh" "${WORK}/fw-offline" --network none > "$LOG" 2>&1
+  PACK_RC=$?
+  check_rc 0
+  if [[ "$(docker inspect -f '{{.Config.User}}' kiln-acc-fw-offline:1.0.0)" == appuser ]]; then passed "最终用户是 appuser"; else failed "最终用户不对"; fi
+}
+
+scenario_cache_env_repointed() {
+  build_framework_base kiln-acc-fw-base:1
+  new_service fw-cache
+  cat >> "${WORK}/fw-cache/pack.conf" <<'EOF'
+RUNTIME_BASE="kiln-acc-fw-base:1"
+BUILDER_BASE="kiln-acc-fw-base:1"
+VERIFY_CMD='
+docker logs "$VERIFY_CONTAINER" 2>&1 | grep -F "HF_DATASETS_CACHE=/opt/not-writable/datasets 不可写"
+docker logs "$VERIFY_CONTAINER" 2>&1 | grep -F "MODELSCOPE_CACHE=/opt/not-writable/modelscope 不可写"
+if docker logs "$VERIFY_CONTAINER" 2>&1 | grep -F "HF_HUB_CACHE="; then exit 7; fi
+'
+EOF
+  pack fw-cache
+  check_rc 0
+  check_log '接口探针通过'
+
+  cat >> "${WORK}/fw-cache/pack.conf" <<'EOF'
+VERIFY_DOCKER_ARGS="-e KILN_KEEP_CACHE_ENV=1"
+VERIFY_CMD='if docker logs "$VERIFY_CONTAINER" 2>&1 | grep -F "不可写"; then exit 7; fi'
+EOF
+  pack fw-cache
+  check_rc 0
+  check_log '接口探针通过'
+}
+
+scenario_verify_docker_args() {
+  new_service docker-args
+  cat >> "${WORK}/docker-args/pack.conf" <<'EOF'
+VERIFY_DOCKER_ARGS="-e ACC_PROBE=hello-from-args"
+VERIFY_CMD='docker exec "$VERIFY_CONTAINER" printenv ACC_PROBE'
+EOF
+  pack docker-args
+  check_rc 0
+  check_log 'hello-from-args'
+}
+
+scenario_runtime_uid() {
+  local image=kiln-acc-run-uid:1.0.0 got
+  new_service run-uid
+  printf 'RUNTIME_UID="1234"\nRUNTIME_GID="2345"\n' >> "${WORK}/run-uid/pack.conf"
+  pack run-uid
+  check_rc 0
+  got="$(docker run --rm --entrypoint /bin/sh "$image" -c 'id -u; id -g; id -un' | tr '\n' ' ')"
+  if [[ "$got" == '1234 2345 appuser ' ]]; then passed "运行用户是 1234:2345"; else failed "运行用户是 ${got}"; fi
+  new_project train-uid demo-train
+  printf 'RUNTIME_UID="1234"\n' >> "${WORK}/train-uid/pack.conf"
+  pack train-uid
+  check_rc 0
+}
+
+scenario_runtime_uid_rejected() {
+  local conf
+  while IFS='|' read -r conf want; do
+    rm -rf "${WORK}/uid-bad"
+    new_service uid-bad
+    printf '%s\n' "$conf" >> "${WORK}/uid-bad/pack.conf"
+    pack uid-bad
+    expect_rejected "$conf" "$want"
+  done <<'EOF'
+RUNTIME_UID="0"|不能用 root
+RUNTIME_UID="abc"|不能用 root
+RUNTIME_GID="-1"|不能用 root
+EOF
+}
+
+scenario_custom_user_at_runtime() {
+  # 用 --user 指定镜像里不存在的 uid（K8s 上常见）。解密失败和停止信号的检查不能因此误判。
+  new_project custom-user demo-train
+  printf 'VERIFY_DOCKER_ARGS="--user 1234:1234"\n' >> "${WORK}/custom-user/pack.conf"
+  pack custom-user
+  check_rc 0
+  check_log '错误密钥时解密失败'
+  check_log 'docker stop 后作业正常退出'
+  check_log 'HOME 不可写'
+  check_nolog '作业没有起来'
+}
+
+scenario_protected_entry_rejected() {
+  new_service entry-module
+  printf 'START_CMD="python -m svc.logic"\n' >> "${WORK}/entry-module/pack.conf"
+  pack entry-module
+  if [[ "$PACK_RC" -ne 0 ]]; then passed "打包失败（码 ${PACK_RC}）"; else failed "打包居然成功了"; fi
+  check_log 'START_CMD 不能直接启动受保护的模块: python -m svc.logic'
+
+  new_service entry-script
+  printf 'PROTECT_GLOBS="svc/logic.py server.py"\n' >> "${WORK}/entry-script/pack.conf"
+  pack entry-script
+  if [[ "$PACK_RC" -ne 0 ]]; then passed "打包失败（码 ${PACK_RC}）"; else failed "打包居然成功了"; fi
+  check_log 'START_CMD 不能直接启动受保护的模块: python server.py'
+}
+
+scenario_failure_log_shows_root_cause() {
+  # 真正的报错在最前面，后面被健康检查的访问日志淹没。
+  new_service root-cause
+  cat > "${WORK}/root-cause/server.py" <<'EOF'
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+
+def load():
+    raise RuntimeError("ACC_ROOT_CAUSE_7d21")
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(503)
+        self.end_headers()
+
+
+threading.Thread(target=load, daemon=True).start()
+HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
+EOF
+  : > "${WORK}/root-cause/svc/logic.py"
+  printf 'VERIFY_TIMEOUT="30"\n' >> "${WORK}/root-cause/pack.conf"
+  pack root-cause
+  check_rc 1
+  check_log '30 秒内健康检查没有通过'
+  check_log 'ACC_ROOT_CAUSE_7d21'
+}
+
+scenario_verify_start_cmd() {
+  local rc
+  new_project smoke demo-train
+  cat >> "${WORK}/smoke/pack.conf" <<'EOF'
+START_CMD='python -c "raise SystemExit(9)"'
+VERIFY_START_CMD="python -m trainer.train --steps 20"
+EOF
+  pack smoke
+  check_rc 0
+  check_log 'steps=20'
+  # 短任务只在验收时用，镜像自己的启动命令不变。
+  docker run --rm -e KILN_SECRET_MARKER=x -e KILN_CONFIG_KEY kiln-acc-smoke:1.0.0 >/dev/null 2>&1
+  rc=$?
+  if [[ "$rc" -eq 9 ]]; then passed "镜像的启动命令没变（码 9）"; else failed "镜像的退出码是 ${rc}，期望 9"; fi
+  if docker history --no-trunc kiln-acc-smoke:1.0.0 | grep -qF 'steps 20'; then failed "短任务写进了镜像历史"; else passed "短任务没有写进镜像"; fi
+}
+
+scenario_verify_loss_off() {
+  new_project loss-off demo-train
+  printf 'LOSS_TAG="no-such-tag="\nVERIFY_LOSS="off"\n' >> "${WORK}/loss-off/pack.conf"
+  pack loss-off
+  check_rc 0
+  check_log 'VERIFY_LOSS=off'
+
+  new_project loss-bad demo-train
+  printf 'VERIFY_LOSS="maybe"\n' >> "${WORK}/loss-bad/pack.conf"
+  pack loss-bad
+  expect_rejected "未知 VERIFY_LOSS" '未知 VERIFY_LOSS'
+}
+
+scenario_loss_with_quotes() {
+  # transformers 5 打印的是 {'loss': '1.23'}，数值带引号。
+  new_project loss-quote demo-train
+  perl -pi -e "s/ loss=\{loss:\.6f\}/ {{'loss': '{loss:.6f}'}}/" "${WORK}/loss-quote/trainer/train.py"
+  cat >> "${WORK}/loss-quote/pack.conf" <<'EOF'
+LOSS_TAG="'loss': "
+EOF
+  pack loss-quote
+  check_rc 0
+  check_log 'loss first=1.872699 last=1.183935'
+}
+
+scenario_stop_check_job_not_started() {
+  new_project stop-nostart demo-train
+  printf 'VERIFY_ENV=""\n' >> "${WORK}/stop-nostart/pack.conf"
+  pack stop-nostart
+  check_rc 1
+  check_log '作业没有起来，无法验证停止信号'
+  check_log '缺少必需环境变量'
+}
+
 ALL_SCENARIOS="
+nonroot_base_offline cache_env_repointed verify_docker_args runtime_uid runtime_uid_rejected custom_user_at_runtime
+protected_entry_rejected failure_log_shows_root_cause verify_start_cmd verify_loss_off loss_with_quotes stop_check_job_not_started
 serve_demo serve_custom_api serve_no_probe serve_probe_fails serve_probe_pipe_fails
 serve_health_timeout serve_exits_early serve_image_config serve_bad_values
 marker_unset marker_empty marker_leak export_fails
