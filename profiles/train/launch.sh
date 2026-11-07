@@ -49,9 +49,10 @@ fi
 # 训练命令（渲染自 pack.conf 的 START_CMD），例如: python -m trainer.train --steps 50
 START_CMD="$(cat /app/.kiln/start_cmd.sh)"
 
-# 启动器自己会拉起 python：去掉 START_CMD 开头的 python/python3，把剩下的「-m 模块 ...」或「脚本 ...」交给它。
+# 启动器自己会拉起 python：去掉 START_CMD 开头的解释器（python、python3.11、/opt/conda/bin/python 等），
+# 把剩下的「-m 模块 ...」或「脚本 ...」交给它。
 strip_python() {
-  printf '%s\n' "${START_CMD}" | sed -E 's/^[[:space:]]*python3?[[:space:]]+//'
+  printf '%s\n' "${START_CMD}" | sed -E 's#^[[:space:]]*(/[^[:space:]]*/)?python[0-9.]*[[:space:]]+##'
 }
 
 # 启动器由项目在 requirements 里安装，没装时给出明确报错。

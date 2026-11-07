@@ -10,6 +10,8 @@ set -uo pipefail
 PROJECT_DIR="$(cd "${1:?用法: verify.sh <项目目录>}" && pwd)"
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../engine" && pwd)/sensitive.sh"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../engine" && pwd)/verify_lib.sh"
 # shellcheck disable=SC1090
 source "$PROJECT_DIR/pack.conf"
 TAG="${APP_NAME}:${VERSION}"
@@ -79,10 +81,9 @@ fi
 if echo "$LISTING" | grep -q '/app/.git'; then bad "镜像里有 .git"; else ok "无 .git"; fi
 
 echo "== 4. 镜像元数据不含来源痕迹 =="
+kiln_check_origin "$TAG" "$ORIGIN_MARKERS"
+# 配置明文和密钥不管从哪来都不能出现，后面的配置加密检查看全部元数据。
 META="$(docker inspect "$TAG"; docker history --no-trunc "$TAG")"
-ORIGIN_PAT='github\.com'
-for m in $ORIGIN_MARKERS; do ORIGIN_PAT="${ORIGIN_PAT}|${m}"; done
-if echo "$META" | grep -qiE "$ORIGIN_PAT"; then bad "元数据里有来源痕迹（匹配 /$ORIGIN_PAT/）"; else ok "元数据无来源痕迹"; fi
 
 echo "== 5. 冒烟训练：正常退出 + 落下 checkpoint + loss 有限且下降 =="
 # 敏感 env 由验收侧注入（真实部署由运维提供，不随镜像发出）；缺了 launch.sh 会拒绝起训。

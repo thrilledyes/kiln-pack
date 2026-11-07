@@ -58,14 +58,21 @@ PIP_REQUIREMENTS="${PIP_REQUIREMENTS:-}"
 # 透传给 pip install -r 的额外参数，默认空。比如 --require-hashes、--only-binary :all:。
 PIP_INSTALL_ARGS="${PIP_INSTALL_ARGS:-}"
 # 这个值走 --build-arg，会留在镜像历史里，所以带账号密码的索引地址不能写在这里。
-case "$PIP_INSTALL_ARGS" in
-  *://*@*)
-    echo "!! PIP_INSTALL_ARGS 不能带账号密码（它会留在镜像历史里），请改用 pip.conf 或 secret 挂载。" >&2
-    exit 2
-    ;;
-  *) ;;
-esac
+if [[ -n "$(printf '%s\n' "$PIP_INSTALL_ARGS" | kiln_lines_with_url_credentials)" ]]; then
+  echo "!! PIP_INSTALL_ARGS 不能带账号密码（它会留在镜像历史里）。私有依赖的安全做法见 USAGE「私有依赖」。" >&2
+  exit 2
+fi
 EXPOSE_PORT="${EXPOSE_PORT:-8000}"
+if [[ ! "$EXPOSE_PORT" =~ ^[0-9]+$ ]]; then
+  echo "!! EXPOSE_PORT 必须是端口号（当前 ${EXPOSE_PORT}）。" >&2
+  exit 2
+fi
+# 容器启动后这段时间内健康检查失败不算数。要加载模型的服务调大，比如 10m。
+HEALTH_START_PERIOD="${HEALTH_START_PERIOD:-20s}"
+if [[ ! "$HEALTH_START_PERIOD" =~ ^[0-9]+(s|m|h)$ ]]; then
+  echo "!! HEALTH_START_PERIOD 要写成 600s、10m 这样（当前 ${HEALTH_START_PERIOD}）。" >&2
+  exit 2
+fi
 HEALTHCHECK_CMD="${HEALTHCHECK_CMD:-true}"
 SECRET_MARKER="${SECRET_MARKER:-}"
 REQUIRED_ENV="${REQUIRED_ENV:-}"
@@ -116,6 +123,15 @@ SRC_ABS="$(cd "${PROJECT_DIR}/${SRC_DIR}" && pwd)"
 # 只接受相对 SRC_DIR 的完整路径，不接受通配，免得一条规则把私钥也放行了。
 PACK_KEEP="${PACK_KEEP:-}"
 KEEP_ARGS=()
+# requirements 会随镜像发出，里面的凭据等于直接交给拿到镜像的人。
+if [[ -n "$PIP_REQUIREMENTS" ]]; then
+  REQ_CREDS="$(cd "$SRC_ABS" && kiln_requirements_credentials "$PIP_REQUIREMENTS")"
+  if [[ -n "$REQ_CREDS" ]]; then
+    echo "!! 这些位置的地址带账号密码或令牌，它们会随镜像发出（私有依赖的安全做法见 USAGE「私有依赖」）:" >&2
+    printf '%s\n' "$REQ_CREDS" | sed 's/^/    /' >&2
+    exit 2
+  fi
+fi
 set -f
 for rel in $PACK_KEEP; do
   case "$rel" in
@@ -213,7 +229,8 @@ echo
 # 用临时构建上下文，避免污染/依赖源码目录本身的 .dockerignore 之类的东西，
 # 也方便把 .git、证据目录等排除在外。
 BUILD_CTX="$(mktemp -d)"
-trap 'rm -rf "$BUILD_CTX"' EXIT
+RENDERED_DOCKERFILE="$(mktemp)"
+trap 'rm -rf "$BUILD_CTX" "$RENDERED_DOCKERFILE"' EXIT
 
 echo "-- 1/3 复制构建上下文（排除 .git / 证据目录 / 预编译产物 / 敏感文件）"
 DROPPED="$(cd "$SRC_ABS" && find . -name .git -prune -o \( "${KILN_SENSITIVE_FIND_ARGS[@]}" \) -print 2>/dev/null | sed 's|^\./||' || true)"
@@ -303,17 +320,21 @@ printf '%s\n' ${REQUIRED_ENV:-} > "${BUILD_CTX}/.kiln/required_env.list"
 set +f
 [ "$CONFIG_ENCRYPT" = on ] && echo KILN_CONFIG_KEY >> "${BUILD_CTX}/.kiln/required_env.list"
 # profile 运行期配置（launch.sh 在镜像内用 /bin/sh source 它决定怎么起）。
-# 用单引号包值，保证 POSIX sh 能安全 source；值本身别含单引号（路径/启动器名不会有）。
+# 启动器参数是用户写的自由文本，可能带单引号，转义后才能安全 source。
+sh_quote() {
+  local value="$1"
+  printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
+}
 {
-  printf 'PROFILE=%s\n' "$PROFILE"
-  printf 'LAUNCHER=%s\n' "$LAUNCHER"
-  printf 'NPROC_PER_NODE=%s\n' "$NPROC_PER_NODE"
-  printf "TORCHRUN_ARGS='%s'\n" "$TORCHRUN_ARGS"
-  printf "DEEPSPEED_ARGS='%s'\n" "$DEEPSPEED_ARGS"
-  printf "ACCELERATE_ARGS='%s'\n" "$ACCELERATE_ARGS"
-  printf "OUTPUT_DIR='%s'\n" "$OUTPUT_DIR"
-  printf 'CONFIG_ENCRYPT=%s\n' "$CONFIG_ENCRYPT"
-  printf "CONFIG_MATERIALIZE='%s'\n" "$CONFIG_MATERIALIZE"
+  printf 'PROFILE=%s\n' "$(sh_quote "$PROFILE")"
+  printf 'LAUNCHER=%s\n' "$(sh_quote "$LAUNCHER")"
+  printf 'NPROC_PER_NODE=%s\n' "$(sh_quote "$NPROC_PER_NODE")"
+  printf 'TORCHRUN_ARGS=%s\n' "$(sh_quote "$TORCHRUN_ARGS")"
+  printf 'DEEPSPEED_ARGS=%s\n' "$(sh_quote "$DEEPSPEED_ARGS")"
+  printf 'ACCELERATE_ARGS=%s\n' "$(sh_quote "$ACCELERATE_ARGS")"
+  printf 'OUTPUT_DIR=%s\n' "$(sh_quote "$OUTPUT_DIR")"
+  printf 'CONFIG_ENCRYPT=%s\n' "$(sh_quote "$CONFIG_ENCRYPT")"
+  printf 'CONFIG_MATERIALIZE=%s\n' "$(sh_quote "$CONFIG_MATERIALIZE")"
 } > "${BUILD_CTX}/.kiln/profile.conf"
 chmod +x "${BUILD_CTX}/.kiln/"*.sh
 
@@ -335,11 +356,15 @@ BUILD_ARGS=(
 # train runtime 需要一个可写产物目录；serve 的 Dockerfile 不声明该 arg，故仅 train 传。
 if [ "$PROFILE" = train ]; then
   BUILD_ARGS+=(--build-arg KILN_OUTPUT_DIR="$OUTPUT_DIR" --build-arg CONFIG_ENCRYPT="$CONFIG_ENCRYPT")
+else
+  BUILD_ARGS+=(--build-arg EXPOSE_PORT="$EXPOSE_PORT")
 fi
+# HEALTHCHECK 的选项不支持 ARG 变量，只能在构建前把值写进 Dockerfile。值在前面已经校验过格式。
+sed "s/--start-period=[0-9a-z]*/--start-period=${HEALTH_START_PERIOD}/" "${PROFILE_DIR}/Dockerfile" > "$RENDERED_DOCKERFILE"
 
 docker build \
   "${BUILD_ARGS[@]}" \
-  -f "${PROFILE_DIR}/Dockerfile" \
+  -f "$RENDERED_DOCKERFILE" \
   -t "$IMAGE_TAG" \
   ${EXTRA_BUILD_ARGS[@]+"${EXTRA_BUILD_ARGS[@]}"} \
   "$BUILD_CTX"

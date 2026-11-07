@@ -7,7 +7,7 @@ KILN_SENSITIVE_NAMES=(
   '*.env' '.env.*' '.envrc'
   '*.pem' '*.key' '*.p12' '*.pfx' '*.jks' '*.keystore'
   'id_rsa' 'id_dsa' 'id_ecdsa' 'id_ed25519'
-  '.netrc' '.pypirc' '.npmrc' '.git-credentials'
+  '.netrc' '.pypirc' '.npmrc' 'pip.conf' '.git-credentials'
   'credentials.json' 'service-account*.json'
 )
 KILN_SENSITIVE_DIRS=('.ssh' '.aws' '.gnupg')
@@ -70,4 +70,38 @@ kiln_sensitive_in_listing() {
     esac
     printf '%s\n' "$path"
   done <<<"$listing"
+}
+
+# 从标准输入读文本，打印带账号密码或令牌的地址所在的行号。只给行号，不把凭据打印出来。
+# 不算凭据的：ssh://git@host 这种只有用户名的；${VAR} 占位符，它们在文本里没有真实的值。
+kiln_lines_with_url_credentials() {
+  grep -nE '[a-zA-Z][a-zA-Z0-9+.-]*://[^/@:[:space:]]+:[^/@[:space:]]+@|https?://[^/@[:space:]]+@' \
+    | grep -vE '^[0-9]+:[^@]*://\$\{[^}]+\}(:\$\{[^}]+\})?@' \
+    | cut -d: -f1
+}
+
+# 打印 requirements 及其 -r / -c 引用的文件里带凭据的位置（路径:行号）。这些文件都会随镜像发出。
+KILN_REQ_SEEN=""
+kiln_requirements_credentials() {
+  local file="$1" dir line ref number
+  [[ -f "$file" ]] || return 0
+  # 用规范化的绝对路径判重：requirements 可能经 ../ 互相引用，直接拼路径会越拼越长，死循环。
+  dir="$(cd "$(dirname "$file")" && pwd)"
+  file="${dir}/$(basename "$file")"
+  case "${KILN_REQ_SEEN}" in
+    *"|${file}|"*) return 0 ;;
+    *) ;;
+  esac
+  KILN_REQ_SEEN="${KILN_REQ_SEEN}|${file}|"
+  while IFS= read -r number; do
+    printf '%s:%s\n' "${file#"${PWD}/"}" "$number"
+  done < <(kiln_lines_with_url_credentials < "$file" || true)
+  while IFS= read -r line; do
+    ref="$(printf '%s\n' "$line" | sed -E 's/^[[:space:]]*(-r|-c|--requirement|--constraint)[=[:space:]]+//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//')"
+    case "$ref" in
+      *://*) ;;
+      /*) kiln_requirements_credentials "$ref" ;;
+      *) kiln_requirements_credentials "${dir}/${ref}" ;;
+    esac
+  done < <(grep -E '^[[:space:]]*(-r|-c|--requirement|--constraint)[=[:space:]]' "$file" || true)
 }

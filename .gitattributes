@@ -1,0 +1,5 @@
+# 这些文件要进 Linux 容器执行，Windows 上检出成 CRLF 会直接跑不起来。
+*.sh text eol=lf
+*.py text eol=lf
+*.conf text eol=lf
+Dockerfile text eol=lf

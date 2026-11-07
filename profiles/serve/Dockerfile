@@ -39,12 +39,15 @@ RUN rm -f /src/.kiln/compile_protect.py
 
 # ---------- runtime ----------
 FROM ${RUNTIME_BASE} AS runtime
+# 构建起点标记：验收查来源痕迹时，只看它之后的构建历史，底座自带的不算。
+LABEL kiln.runtime.begin="1"
 ARG KILN_APP=app
 ARG KILN_VERSION=dev
 ARG KILN_BUILD_ID=unknown
 ARG KILN_BUILT_AT=unknown
 ARG PIP_REQUIREMENTS=""
 ARG PIP_INSTALL_ARGS=""
+ARG EXPOSE_PORT=8000
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     KILN_APP=${KILN_APP} \
@@ -65,7 +68,7 @@ RUN set -eux; \
     fi
 # 非 root 运行：抬高同容器内 ptrace / 读 /proc/<pid>/mem 等攻击的门槛。
 # 依赖已在上面以 root 装好，运行期只读执行 /app，不需要写权限。
-# 注：需要写缓存目录或访问设备（如 GPU）的框架，后续用 pack.conf 开关放宽。
+# 注：框架的缓存默认写在 HOME（/home/appuser，可写）下。访问 GPU 等设备还没有在真实环境验证过。
 # 构建上下文（mktemp -d 0700 + rsync）目录权限不含 others 位，
 # 切非 root 前先给 /app 放开只读访问（a+rX：只加读和目录执行位，不给写）。
 RUN useradd -u 10001 -m -d /home/appuser -s /usr/sbin/nologin appuser \
@@ -75,6 +78,8 @@ LABEL kiln.app="${KILN_APP}" \
       kiln.version="${KILN_VERSION}" \
       kiln.build_id="${KILN_BUILD_ID}" \
       kiln.built_at="${KILN_BUILT_AT}"
+EXPOSE ${EXPOSE_PORT}
+# --start-period 由 pack.sh 按 HEALTH_START_PERIOD 改写，这里的值是默认值。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD ["/bin/sh", "/app/.kiln/healthcheck.sh"]
 ENTRYPOINT ["/bin/sh", "/app/.kiln/launch.sh"]

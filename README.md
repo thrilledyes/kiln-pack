@@ -17,7 +17,8 @@ engine/   公共引擎（与交付形态无关）
   encrypt_config.py    打包阶段把配置加密成 .enc（train）
   kiln_config.py       镜像内的配置读取助手：在内存里解密，明文不落盘（train）
   kiln_init.py         容器的 PID 1：把 docker stop 的信号转给作业，传回退出码
-  sensitive.sh         敏感文件规则：打包时排除，验收时发现就判失败
+  sensitive.sh         敏感文件和地址凭据的规则：打包时排除或拒绝，验收时发现就判失败
+  verify_lib.sh        两个 profile 的验收脚本共用的检查
 
 profiles/ 两种交付形态，各自的 Dockerfile + 启动/验收脚本
   serve/   常驻服务：Dockerfile（非 root 只读）/ launch.sh / healthcheck.sh / verify.sh
@@ -64,7 +65,8 @@ bash engine/pack.sh tests/demo-train
 
 ## 通用性
 
-- **serve** 已在 vLLM / SGLang 生态上验证过完整打包流程（受保护模块真实 import 框架 API，编成 `.so` 组装进镜像）。
+- **serve** 的端到端验收目前只覆盖 `demo-fastapi` 和一个接口不同的标准库小服务（见 `tests/acceptance.sh`）。
+  早期做过 vLLM / SGLang 的打包试验，但仓库里没有对应的配置和验收记录，接口探针改成可配置之后也没有重跑，不能算验证过。
 - **train** 目前以 CPU torch demo 验证了完整链路（编译保护 → 起训 → 冒烟验收）；真实 GPU/CANN 框架的打包待在有卡环境验证。
   `torchrun` / `deepspeed` / `accelerate` 都在 CPU 上验证过能拉起两个进程并跑完，但 demo 没有调用 `deepspeed.initialize` 和 `Accelerator`，它们和编译保护、真实 GPU 的配合还没验证。
 

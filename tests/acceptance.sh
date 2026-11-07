@@ -95,6 +95,37 @@ pack() {
   PACK_RC=$?
 }
 
+# pack_with_key <密钥> <项目名>：用指定的密钥打包，空字符串表示没有密钥。
+pack_with_key() {
+  local saved="$KILN_CONFIG_KEY"
+  KILN_CONFIG_KEY="$1"
+  pack "$2"
+  KILN_CONFIG_KEY="$saved"
+}
+
+# expect_rejected <描述> <期望的报错片段>：打包前就要拒绝，退出码 2，而且没有开始构建。
+expect_rejected() {
+  if [[ "$PACK_RC" -eq 2 ]] && grep -qF -e "$2" "$LOG" && ! grep -qF 'docker build（两阶段' "$LOG"; then
+    passed "拒绝: $1"
+  else
+    failed "$1 没有被正确拒绝（码 ${PACK_RC}）"
+  fi
+}
+
+# pin_hashes <requirements 路径>：换成带完整哈希的版本。
+pin_hashes() {
+  local file="$1"
+  docker run -i --rm python:3.11-slim-bookworm sh -c 'pip install -q --root-user-action=ignore pip-tools >/dev/null 2>&1; cat > /tmp/r.in; cd /tmp; pip-compile -q --generate-hashes --allow-unsafe --no-header --no-annotate --output-file=- r.in' \
+    < "$file" > "${file}.new" 2>/dev/null
+  mv "${file}.new" "$file"
+}
+
+# fetch_wheel <目录>：下载一个 wheel 到目录，模拟提前下载好的私有依赖。
+fetch_wheel() {
+  mkdir -p "$1"
+  docker run --rm python:3.11-slim-bookworm sh -c 'pip download -q --no-deps -d /w six==1.16.0 >/dev/null 2>&1; tar -C /w -cf - .' | tar -xf - -C "$1"
+}
+
 verify() {
   bash "${ROOT}/profiles/$2/verify.sh" "${WORK}/$1" > "$LOG" 2>&1
   PACK_RC=$?
@@ -434,14 +465,370 @@ EOF
   check_log '配置已解密到内存盘'
 }
 
+# ---------- train：配置加密的拒绝场景和假通过拦截 ----------
+scenario_config_rejected() {
+  new_project cfg-reject demo-train
+  pack_with_key "" cfg-reject
+  expect_rejected "没有密钥" '必须 export KILN_CONFIG_KEY'
+  rm -rf "${WORK}/cfg-reject"
+
+  local conf
+  while IFS='|' read -r conf want; do
+    new_project cfg-reject demo-train
+    printf '%s\n' "$conf" >> "${WORK}/cfg-reject/pack.conf"
+    pack cfg-reject
+    expect_rejected "$conf" "$want"
+    rm -rf "${WORK}/cfg-reject"
+  done <<'EOF'
+CONFIG_GLOBS=""|必须设置 CONFIG_GLOBS
+CONFIG_GLOBS="nope/*.yaml"|没有匹配到文件
+CONFIG_GLOBS="configs/**/*.yaml"|不支持 **
+CONFIG_GLOBS="../x.yaml"|相对路径
+CONFIG_ENCRYPT="maybe"|未知 CONFIG_ENCRYPT
+CONFIG_MATERIALIZE="configs/none.yaml"|不在 CONFIG_GLOBS
+EOF
+
+  new_project cfg-serve demo-fastapi
+  printf 'CONFIG_ENCRYPT="on"\nCONFIG_GLOBS="x"\n' >> "${WORK}/cfg-serve/pack.conf"
+  pack cfg-serve
+  expect_rejected "serve 不支持加密" '只支持 PROFILE=train'
+}
+
+scenario_config_bad_key() {
+  new_project cfg-badkey demo-train
+  pack_with_key 'not base64!!' cfg-badkey
+  check_rc 1
+  check_log '不是合法的 base64'
+}
+
+scenario_config_not_covered() {
+  new_project cfg-leak demo-train
+  printf 'CONFIG_GLOBS="configs/other.yaml"\n' >> "${WORK}/cfg-leak/pack.conf"
+  printf 'a: 1\n' > "${WORK}/cfg-leak/configs/other.yaml"
+  pack cfg-leak
+  check_rc 1
+  check_log '这些配置不在 CONFIG_GLOBS 里'
+  check_log '镜像层里有配置明文'
+}
+
+scenario_job_leaks_config() {
+  local train="${WORK}/job-leak/trainer/train.py"
+  new_project job-leak demo-train
+  perl -pi -e 's/^(\s*)cfg = load_yaml\(args\.config\)$/$1cfg = load_yaml(args.config)\n$1print("tag", cfg["recipe_tag"], flush=True)/' "$train"
+  perl -pi -e 's/^(\s*)"steps": args\.steps,$/$1"steps": args.steps,\n$1"cfg": cfg,/' "$train"
+  pack job-leak
+  check_rc 1
+  check_log '作业日志里有配置明文'
+  check_log '产物目录里有配置明文'
+}
+
+scenario_job_ignores_config() {
+  new_project job-ignore demo-train
+  perl -pi -e 's/^(\s*)cfg = load_yaml\(args\.config\)$/$1cfg = {"model":{"dim":16,"hidden":64},"train":{"batch":64,"base_lr":0.1,"warmup_ratio":0.1},"loss":{"huber_delta":1.0}}/' "${WORK}/job-ignore/trainer/train.py"
+  pack job-ignore
+  check_rc 1
+  check_log '错误密钥时作业仍然跑通'
+}
+
+scenario_encrypt_off() {
+  local found
+  new_project enc-off demo-train
+  printf 'CONFIG_ENCRYPT="off"\n' >> "${WORK}/enc-off/pack.conf"
+  pack_with_key "" enc-off
+  check_rc 0
+  found="$(docker run --rm --entrypoint python kiln-acc-enc-off:1.0.0 -c 'import importlib.util as u; print(u.find_spec("cryptography") is not None)')"
+  if [[ "$found" == False ]]; then passed "关闭加密时镜像里没有 cryptography"; else failed "cryptography 已安装: ${found}"; fi
+}
+
+scenario_protected_imports_kiln_config() {
+  local recipe="${WORK}/protected-cfg/trainer/recipe.py"
+  new_project protected-cfg demo-train
+  { echo 'import kiln_config'; cat "$recipe"; } > "${recipe}.new"
+  mv "${recipe}.new" "$recipe"
+  cat >> "${WORK}/protected-cfg/pack.conf" <<'EOF'
+LAUNCHER="torchrun"
+NPROC_PER_NODE="2"
+VERIFY_LOG_CONTAINS="world_size=2"
+EOF
+  pack protected-cfg
+  check_rc 0
+}
+
+# ---------- train：启动器的失败路径 ----------
+scenario_accelerate_cpu_detected() {
+  # accelerate --cpu 会忽略进程数，悄悄退回单进程，VERIFY_LOG_CONTAINS 要抓得到。
+  new_project accel-cpu demo-train
+  printf 'accelerate\nnumpy\n' >> "${WORK}/accel-cpu/requirements.txt"
+  cat >> "${WORK}/accel-cpu/pack.conf" <<'EOF'
+LAUNCHER="accelerate"
+NPROC_PER_NODE="2"
+ACCELERATE_ARGS="--cpu"
+VERIFY_LOG_CONTAINS="world_size=2"
+EOF
+  pack accel-cpu
+  check_rc 1
+  check_log '日志里没有 world_size=2'
+}
+
+scenario_launcher_not_installed() {
+  new_project launcher-missing demo-train
+  printf 'LAUNCHER="deepspeed"\n' >> "${WORK}/launcher-missing/pack.conf"
+  pack launcher-missing
+  check_rc 1
+  check_log '需要命令 deepspeed'
+}
+
+scenario_launcher_unknown() {
+  new_project launcher-unknown demo-train
+  printf 'LAUNCHER="mpirun"\n' >> "${WORK}/launcher-unknown/pack.conf"
+  pack launcher-unknown
+  check_rc 1
+  check_log '未知 LAUNCHER'
+  # 作业失败时验收要走完全部检查，不能中途退出。
+  check_log '验收失败'
+  check_nolog 'unbound variable'
+}
+
+scenario_start_cmd_interpreter_path() {
+  local cmd
+  for cmd in 'python3.11 -m trainer.train --steps 50' '/usr/local/bin/python -m trainer.train --steps 50'; do
+    rm -rf "${WORK}/interp"
+    new_project interp demo-train
+    cat >> "${WORK}/interp/pack.conf" <<EOF
+LAUNCHER="torchrun"
+NPROC_PER_NODE="2"
+VERIFY_LOG_CONTAINS="world_size=2"
+START_CMD="${cmd}"
+EOF
+    pack interp
+    check_rc 0
+    check_log 'world_size=2'
+  done
+}
+
+scenario_launcher_args_with_quotes() {
+  new_project launcher-quotes demo-train
+  cat >> "${WORK}/launcher-quotes/pack.conf" <<'EOF'
+LAUNCHER="torchrun"
+NPROC_PER_NODE="2"
+TORCHRUN_ARGS="--master_port='29555'"
+VERIFY_LOG_CONTAINS="world_size=2"
+EOF
+  pack launcher-quotes
+  check_rc 0
+  check_log "--master_port='29555'"
+}
+
+# ---------- 依赖安装 ----------
+scenario_deps_cache_reuse() {
+  new_project cache demo-train
+  pack cache
+  check_rc 0
+  pack cache
+  check_rc 0
+  if grep -qF 'Downloading torch-' "$LOG"; then failed "什么都没改，又下载了 torch"; else passed "什么都没改时不下载 torch"; fi
+  echo '# 只改一行代码注释' >> "${WORK}/cache/trainer/train.py"
+  pack cache
+  check_rc 0
+  if grep -qF 'Downloading torch-' "$LOG"; then failed "只改代码，又下载了 torch"; else passed "只改代码时不下载 torch"; fi
+}
+
+scenario_deps_relative_requirements() {
+  local dir="${WORK}/deps-rel"
+  new_project deps-rel demo-train
+  cp "${dir}/requirements.txt" "${dir}/base.txt"
+  printf -- '-r base.txt\n' > "${dir}/requirements.txt"
+  pack deps-rel
+  check_rc 0
+}
+
+scenario_deps_in_base() {
+  printf 'FROM python:3.11-slim-bookworm\nRUN pip install --no-cache-dir torch==2.5.1 pyyaml==6.0.2\n' \
+    | docker build -q -t kiln-acc-torch-base:1 - >/dev/null
+  new_project deps-base demo-train
+  cat >> "${WORK}/deps-base/pack.conf" <<'EOF'
+PIP_REQUIREMENTS=""
+RUNTIME_BASE="kiln-acc-torch-base:1"
+BUILDER_BASE="kiln-acc-torch-base:1"
+EOF
+  pack deps-base
+  check_rc 0
+}
+
+scenario_pip_only_binary() {
+  new_project pip-bin demo-train
+  printf 'PIP_INSTALL_ARGS="--only-binary :all:"\n' >> "${WORK}/pip-bin/pack.conf"
+  pack pip-bin
+  check_rc 0
+  check_log 'pip install --no-cache-dir --only-binary :all: -r'
+}
+
+scenario_pip_hashes_missing() {
+  new_project pip-nohash demo-train
+  printf 'PIP_INSTALL_ARGS="--require-hashes"\n' >> "${WORK}/pip-nohash/pack.conf"
+  pack pip-nohash
+  check_rc 1
+  check_log 'Hashes are required'
+}
+
+scenario_pip_sdist_only() {
+  new_project pip-sdist demo-train
+  printf 'PIP_INSTALL_ARGS="--only-binary :all:"\n' >> "${WORK}/pip-sdist/pack.conf"
+  printf 'pycrypto==2.6.1\n' >> "${WORK}/pip-sdist/requirements.txt"
+  pack pip-sdist
+  check_rc 1
+  check_log 'No matching distribution'
+}
+
+scenario_pip_full_hashes() {
+  new_project pip-hash-train demo-train
+  printf 'PIP_INSTALL_ARGS="--require-hashes --only-binary :all:"\n' >> "${WORK}/pip-hash-train/pack.conf"
+  pin_hashes "${WORK}/pip-hash-train/requirements.txt"
+  pack pip-hash-train
+  check_rc 0
+  new_project pip-hash-serve demo-fastapi
+  printf 'PIP_INSTALL_ARGS="--require-hashes --only-binary :all:"\n' >> "${WORK}/pip-hash-serve/pack.conf"
+  pin_hashes "${WORK}/pip-hash-serve/requirements.txt"
+  pack pip-hash-serve
+  check_rc 0
+}
+
+scenario_pip_args_credentials() {
+  new_service pip-cred
+  printf 'PIP_INSTALL_ARGS="--index-url https://user:acc-secret-pw@pypi.example.com/simple"\n' >> "${WORK}/pip-cred/pack.conf"
+  pack pip-cred
+  expect_rejected "PIP_INSTALL_ARGS 带账号密码" '不能带账号密码'
+  check_nolog 'acc-secret-pw'
+}
+
+scenario_requirements_credentials() {
+  local dir="${WORK}/req-cred"
+  new_service req-cred
+  printf 'PIP_REQUIREMENTS="requirements.txt"\n' >> "${dir}/pack.conf"
+  printf 'six==1.16.0\n--extra-index-url https://user:acc-secret-pw@pypi.example.com/simple\n' > "${dir}/requirements.txt"
+  pack req-cred
+  expect_rejected "requirements 带账号密码" 'requirements.txt:2'
+  check_nolog 'acc-secret-pw'
+  mkdir -p "${dir}/deps"
+  printf -- '-r deps/base.txt\n' > "${dir}/requirements.txt"
+  printf 'pkg @ git+https://x-access-token:acc-secret-pw@git.example.com/o/r.git\n' > "${dir}/deps/base.txt"
+  pack req-cred
+  expect_rejected "-r 引用的文件带令牌" 'deps/base.txt:1'
+  check_nolog 'acc-secret-pw'
+}
+
+scenario_private_wheels() {
+  local dir="${WORK}/wheels-serve" found
+  new_service wheels-serve
+  fetch_wheel "${dir}/wheels"
+  printf 'PIP_REQUIREMENTS="requirements.txt"\n' >> "${dir}/pack.conf"
+  printf -- '--no-index\n--find-links wheels\nsix==1.16.0\n' > "${dir}/requirements.txt"
+  pack wheels-serve
+  check_rc 0
+  found="$(docker run --rm --entrypoint python kiln-acc-wheels-serve:1.0.0 -c 'import six; print(six.__version__)')"
+  if [[ "$found" == 1.16.0 ]]; then passed "服务镜像里装上了提前下载的 wheel"; else failed "six 版本: ${found}"; fi
+
+  dir="${WORK}/wheels-train"
+  new_project wheels-train demo-train
+  fetch_wheel "${dir}/wheels"
+  printf -- '--find-links wheels\nsix==1.16.0\n' >> "${dir}/requirements.txt"
+  pack wheels-train
+  check_rc 0
+  found="$(docker run --rm --entrypoint python kiln-acc-wheels-train:1.0.0 -c 'import six; print(six.__version__)')"
+  if [[ "$found" == 1.16.0 ]]; then passed "训练镜像里装上了提前下载的 wheel"; else failed "six 版本: ${found}"; fi
+}
+
+# ---------- 来源痕迹：底座自带的不算，本次构建写入的要抓到 ----------
+scenario_origin_base_ignored() {
+  printf 'FROM python:3.11-slim-bookworm\nLABEL org.opencontainers.image.source=https://github.com/example/base\nRUN echo cloned https://github.com/example/base && mkdir -p /opt/framework/.git\nENV FRAMEWORK_URL=https://github.com/example/base\n' \
+    | docker build -q -t kiln-acc-github-base:1 - >/dev/null
+  new_service origin-serve
+  cat >> "${WORK}/origin-serve/pack.conf" <<'EOF'
+RUNTIME_BASE="kiln-acc-github-base:1"
+BUILDER_BASE="kiln-acc-github-base:1"
+EOF
+  pack origin-serve
+  check_rc 0
+  check_log '元数据无来源痕迹'
+  check_log '无 .git'
+
+  printf 'FROM kiln-acc-github-base:1\nRUN pip install --no-cache-dir torch==2.5.1 pyyaml==6.0.2\n' \
+    | docker build -q -t kiln-acc-github-torch:1 - >/dev/null
+  new_project origin-train demo-train
+  cat >> "${WORK}/origin-train/pack.conf" <<'EOF'
+PIP_REQUIREMENTS=""
+RUNTIME_BASE="kiln-acc-github-torch:1"
+BUILDER_BASE="kiln-acc-github-torch:1"
+EOF
+  pack origin-train
+  check_rc 0
+  check_log '元数据无来源痕迹'
+}
+
+scenario_origin_own_detected() {
+  new_service origin-own
+  printf 'PIP_INSTALL_ARGS="--find-links https://github.com/example/wheels"\n' >> "${WORK}/origin-own/pack.conf"
+  pack origin-own
+  check_rc 1
+  check_log '元数据里有来源痕迹'
+}
+
+scenario_origin_project_marker() {
+  new_service origin-marker
+  cat >> "${WORK}/origin-marker/pack.conf" <<'EOF'
+PIP_INSTALL_ARGS="--find-links https://acc-private-org.example.com/wheels"
+ORIGIN_MARKERS="acc-private-org"
+EOF
+  pack origin-marker
+  check_rc 1
+  check_log '元数据里有来源痕迹'
+}
+
+# ---------- serve：镜像元数据 ----------
+scenario_serve_image_config() {
+  local image=kiln-acc-serve-config:1.0.0
+  new_service serve-config
+  pack serve-config
+  check_rc 0
+  if [[ "$(docker inspect -f '{{.Config.Healthcheck.StartPeriod}}' "$image")" == 20s ]]; then passed "默认 start-period 是 20s"; else failed "默认 start-period 不对"; fi
+  cat >> "${WORK}/serve-config/pack.conf" <<'EOF'
+HEALTH_START_PERIOD="10m"
+EOF
+  pack serve-config
+  check_rc 0
+  if [[ "$(docker inspect -f '{{.Config.Healthcheck.StartPeriod}}' "$image")" == 10m0s ]]; then passed "HEALTH_START_PERIOD 生效"; else failed "HEALTH_START_PERIOD 没生效"; fi
+  if [[ "$(docker inspect -f '{{json .Config.ExposedPorts}}' "$image")" == *'8000/tcp'* ]]; then passed "镜像 EXPOSE 了 8000"; else failed "镜像没有 EXPOSE 8000"; fi
+}
+
+scenario_serve_bad_values() {
+  local conf
+  while IFS='|' read -r conf want; do
+    rm -rf "${WORK}/serve-badval"
+    new_service serve-badval
+    printf '%s\n' "$conf" >> "${WORK}/serve-badval/pack.conf"
+    pack serve-badval
+    expect_rejected "$conf" "$want"
+  done <<'EOF'
+EXPOSE_PORT="abc"|EXPOSE_PORT 必须是端口号
+HEALTH_START_PERIOD="soon"|HEALTH_START_PERIOD 要写成
+HEALTH_START_PERIOD="10m/;s/x/"|HEALTH_START_PERIOD 要写成
+EOF
+}
+
 ALL_SCENARIOS="
 serve_demo serve_custom_api serve_no_probe serve_probe_fails serve_probe_pipe_fails
-serve_health_timeout serve_exits_early
+serve_health_timeout serve_exits_early serve_image_config serve_bad_values
 marker_unset marker_empty marker_leak export_fails
 sensitive_excluded keep_rejected train_sensitive
+origin_base_ignored origin_own_detected origin_project_marker
 train_demo train_exit_code train_compound_cmd
+config_rejected config_bad_key config_not_covered job_leaks_config job_ignores_config encrypt_off protected_imports_kiln_config
 signal_single signal_torchrun
 launcher_accelerate launcher_deepspeed config_materialize
+accelerate_cpu_detected launcher_not_installed launcher_unknown start_cmd_interpreter_path launcher_args_with_quotes
+deps_cache_reuse deps_relative_requirements deps_in_base
+pip_only_binary pip_hashes_missing pip_sdist_only pip_full_hashes pip_args_credentials
+requirements_credentials private_wheels
 "
 
 for SCENARIO in ${*:-$ALL_SCENARIOS}; do

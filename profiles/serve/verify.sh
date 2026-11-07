@@ -9,6 +9,8 @@ set -uo pipefail
 PROJECT_DIR="$(cd "${1:?用法: verify.sh <项目目录>}" && pwd)"
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../engine" && pwd)/sensitive.sh"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../engine" && pwd)/verify_lib.sh"
 # shellcheck disable=SC1090
 source "$PROJECT_DIR/pack.conf"
 TAG="${APP_NAME}:${VERSION}"
@@ -80,13 +82,11 @@ elif [[ "$SCAN_OK" -eq 1 ]]; then
   else ok "静态交付物（镜像/归档）中无此敏感值——已外置为运行时注入"; fi
   echo "  [i] 边界：服务运行后该值会驻留进程内存，dump /proc/<pid>/mem 仍可取回；env 外置只保证不随镜像发出。"
 fi
-if find "$EXPORT_DIR" -name '.git' -maxdepth 4 | grep -q .; then bad "镜像里有 .git"; else ok "无 .git"; fi
+# 只查 /app：底座里框架自带的 .git（比如 clone 下来的依赖）不是这个项目的。
+if find "$EXPORT_DIR/app" -name '.git' | grep -q .; then bad "镜像里有 .git"; else ok "无 .git"; fi
 
 echo "== 4. 镜像元数据不含来源痕迹 =="
-META="$(docker inspect "$TAG"; docker history --no-trunc "$TAG")"
-ORIGIN_PAT='github\.com'
-for m in $ORIGIN_MARKERS; do ORIGIN_PAT="${ORIGIN_PAT}|${m}"; done
-if echo "$META" | grep -qiE "$ORIGIN_PAT"; then bad "元数据里有来源痕迹（匹配 /$ORIGIN_PAT/）"; else ok "元数据无来源痕迹"; fi
+kiln_check_origin "$TAG" "$ORIGIN_MARKERS"
 
 echo "== 5. 起服 + 健康检查 + 接口探针 =="
 # 敏感 env 由验收侧注入（真实部署由运维提供，不随镜像发出）；缺了 launch.sh 会拒绝起服。

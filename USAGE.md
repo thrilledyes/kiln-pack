@@ -53,7 +53,8 @@ HEALTHCHECK_CMD="python -c \"import urllib.request,sys; sys.exit(0 if urllib.req
 SECRET_MARKER="CHANGE_ME_UNIQUE_MARKER"   # 敏感常量别硬编码进源码
 REQUIRED_ENV="MY_SECRET"                  # 起服必需的环境变量，缺了拒绝启动
 VERIFY_ENV="MY_SECRET=whatever-for-verify"
-VERIFY_TIMEOUT="60"                       # 等服务变健康的秒数，要加载模型的服务调大
+VERIFY_TIMEOUT="60"                       # 验收时等服务变健康的秒数，要加载模型的服务调大
+HEALTH_START_PERIOD="20s"                 # 容器启动后这段时间内健康检查失败不算数，比如 10m
 VERIFY_CMD='
 R="$(curl -fsS --max-time 30 "$VERIFY_BASE_URL/v1/models")"
 echo "$R"
@@ -62,6 +63,8 @@ grep -q my-model <<<"$R"
 ```
 
 - `HEALTHCHECK_CMD` 在容器内执行，通过前一直重试，直到 `VERIFY_TIMEOUT`。镜像里的 `HEALTHCHECK` 用的也是它。
+- `EXPOSE_PORT` 会写进镜像的 `EXPOSE`，也是验收时映射的端口。
+- 第 4 步的来源痕迹（`github.com` 和 `ORIGIN_MARKERS`）只查本次构建写入的内容，底座自带的 label 和构建历史不算。
 - `VERIFY_CMD` 是接口探针，健康检查通过后在打包机上用 `bash -euo pipefail` 执行一次，退出码非 0 判失败。
   可以用 `$VERIFY_BASE_URL`（映射到本机的服务地址）、`$VERSION`、`$VERIFY_CONTAINER`（容器名）、`$PROJECT_DIR`。
   探针写得长就放进脚本：`VERIFY_CMD='bash "$PROJECT_DIR/probe.sh"'`。写 `curl` 时记得带 `--max-time`。
@@ -199,7 +202,7 @@ docker run --rm \
 
 - 环境变量文件：`*.env`、`.env.*`、`.envrc`
 - 密钥和证书：`*.pem`、`*.key`、`*.p12`、`*.pfx`、`*.jks`、`*.keystore`、`id_rsa`、`id_dsa`、`id_ecdsa`、`id_ed25519`
-- 凭据：`.netrc`、`.pypirc`、`.npmrc`、`.git-credentials`、`credentials.json`、`service-account*.json`
+- 凭据：`.netrc`、`.pypirc`、`.npmrc`、`pip.conf`、`.git-credentials`、`credentials.json`、`service-account*.json`
 - 凭据目录：`.ssh/`、`.aws/`、`.gnupg/`
 
 验收时如果在 `/app` 里发现命中规则的文件，会直接判失败。确实要随镜像发出的文件（比如公开的 CA 证书），逐个写完整路径：
@@ -208,7 +211,25 @@ docker run --rm \
 PACK_KEEP="certs/ca.pem certs/intermediate.pem"   # 相对 SRC_DIR，不支持通配，凭据目录里的文件不能放行
 ```
 
-这份规则只认文件名，查不出名字普通、内容却是密钥的文件。依赖安装和配置文件里的凭据也不在范围内。
+这份规则只认文件名，查不出名字普通、内容却是密钥的文件，配置文件内容里的凭据也不在范围内。
+
+## 私有依赖
+
+`requirements`（包括它 `-r`、`-c` 引用的文件）和 `PIP_INSTALL_ARGS` 里，带账号密码或令牌的地址会在打包前被拒绝，因为它们会随镜像发出。
+报错只给文件和行号，不会把凭据打印出来。
+
+目前打包器不支持在构建时注入凭据。私有依赖的做法是提前下载成 wheel，放进源码目录：
+
+```bash
+pip download -d wheels --no-deps my-private-pkg==1.2.3   # 在有权限的机器上执行，平台要和镜像一致
+```
+```text
+# requirements.txt
+--find-links wheels
+my-private-pkg==1.2.3
+```
+
+`--find-links` 的路径相对 requirements 文件。这些 wheel 会进镜像，里面的代码没有编译保护。
 
 ## 停止信号（serve 和 train 都生效）
 

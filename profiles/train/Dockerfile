@@ -54,6 +54,8 @@ RUN rm -f /src/.kiln/compile_protect.py /src/.kiln/pip-requirements.txt
 
 # ---------- runtime ----------
 FROM ${RUNTIME_BASE} AS runtime
+# 构建起点标记：验收查来源痕迹时，只看它之后的构建历史，底座自带的不算。
+LABEL kiln.runtime.begin="1"
 # 必须排在 KILN_BUILD_ID 之前：它每次构建都变，后面的 RUN 都会隐式带上它，缓存全部失效。
 ARG CONFIG_ENCRYPT=off
 ARG PIP_INSTALL_ARGS=""
