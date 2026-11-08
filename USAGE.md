@@ -228,6 +228,10 @@ RUNTIME_UID="1036"   # 打包时指定运行用户，RUNTIME_GID 默认和它相
 
 启动时会检查 `HF_HOME`、`HF_HUB_CACHE`、`HF_DATASETS_CACHE`、`TRANSFORMERS_CACHE`、`MODELSCOPE_CACHE`、`TORCH_HOME`、`XDG_CACHE_HOME`、`TORCH_EXTENSIONS_DIR`、`TRITON_CACHE_DIR`，写不了的改到 `HOME` 下，并在日志里说明。写得了的不动。底座里预置了只读缓存、又确实要用时，运行时设 `KILN_KEEP_CACHE_ENV=1` 跳过这一步。
 
+**构建阶段没有 GPU 驱动**
+
+`docker build` 里没有 `libcuda.so.1` 这些驱动库。受保护模块 import 了一 import 就要它们的框架（比如 SGLang）时，自检会跳过并打印 `[WARN]`，这时要靠验收在有卡的容器里确认能加载，所以要配好 `VERIFY_DOCKER_ARGS` 和 `VERIFY_CMD`。其他 import 错误还是会让打包失败，`libcudart`、`libnuma` 这种由底座提供的库也一样，缺了说明底座没装好。
+
 **入口不能是受保护的模块**
 
 `python -m 受保护模块` 和 `python 受保护脚本.py` 跑不起来（`No code object available`），打包时就会报错。入口留明文，或者写成 `python -c "from 模块 import main; main()"`。

@@ -9,7 +9,26 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "engine"))
 
-from compile_protect import protected_entries  # noqa: E402
+from compile_protect import missing_gpu_driver, protected_entries  # noqa: E402
+
+
+class MissingGpuDriver(unittest.TestCase):
+    def test_driver_libraries_are_recognized(self):
+        for text in (
+            "libcuda.so.1: cannot open shared object file: No such file or directory",
+            "libnvidia-ml.so.1: cannot open shared object file",
+            "libnvcuda.so: cannot open shared object file",
+        ):
+            self.assertTrue(missing_gpu_driver(ImportError(text)), text)
+
+    def test_other_errors_still_fail(self):
+        for text in (
+            "libnuma.so.1: cannot open shared object file",
+            "libcudart.so.11.0: cannot open shared object file",
+            "No module named 'torch'",
+            "undefined symbol: PyFoo",
+        ):
+            self.assertFalse(missing_gpu_driver(ImportError(text)), text)
 
 
 class ProtectedEntries(unittest.TestCase):

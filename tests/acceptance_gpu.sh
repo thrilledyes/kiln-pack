@@ -10,6 +10,8 @@
 # 可选:
 #   KILN_GPU_BUILDER  builder 底座，默认和运行底座相同；离线环境要预装 Cython
 #   KILN_GPU_IDS      用哪两张卡，默认 0,1。卡上有别的进程时拒绝开始
+#   KILN_GPU_SGLANG_BASE  装好 SGLang 的运行底座，设了才跑 sglang 场景
+#   KILN_GPU_SGLANG_BUILDER  SGLang 的 builder 底座，默认和运行底座相同，要预装 Cython
 # 镜像都以 kiln-gpuacc- 开头，跑完自动清掉。需要 lora 场景时底座要有 llamafactory-cli。
 set -uo pipefail
 
@@ -266,6 +268,70 @@ scenario_serve_model_unreadable() {
   check_log 'Permission denied'
 }
 
+# ---------- 真实推理框架：SGLang（要设 KILN_GPU_SGLANG_BASE）----------
+# 受保护模块调用 SGLang 的启动 API，入口留明文。SGLang 用 spawn 起子进程，子进程也要能加载 .so。
+write_sglang_service() {
+  local p="$1" name="$2" extra_args="$3" gpus="$4"
+  mkdir -p "${p}/proj"; : > "${p}/proj/__init__.py"
+  cat > "${p}/proj/launcher.py" <<'PY'
+import sys
+
+from sglang.srt.entrypoints.http_server import launch_server
+from sglang.srt.server_args import prepare_server_args
+
+
+def main():
+    print("[proj] 受保护模块接管启动", flush=True)
+    launch_server(prepare_server_args(sys.argv[1:]))
+PY
+  cat > "${p}/serve.py" <<'PY'
+from proj.launcher import main
+
+if __name__ == "__main__":
+    main()
+PY
+  { printf 'PROFILE="serve"\n'; common_conf "$name"; cat <<EOF
+RUNTIME_BASE="${KILN_GPU_SGLANG_BASE}"
+BUILDER_BASE="${KILN_GPU_SGLANG_BUILDER:-$KILN_GPU_SGLANG_BASE}"
+PROTECT_GLOBS="proj/launcher.py"
+RUNTIME_UID="${MODEL_UID}"
+RUNTIME_GID="${MODEL_GID}"
+START_CMD="python serve.py --model-path /models/m --host 0.0.0.0 --port 8000 --mem-fraction-static 0.8 --disable-cuda-graph ${extra_args}"
+EXPOSE_PORT="8000"
+HEALTH_START_PERIOD="10m"
+VERIFY_TIMEOUT="400"
+VERIFY_STOP_TIMEOUT="60"
+HEALTHCHECK_CMD="python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)\""
+VERIFY_DOCKER_ARGS='--gpus "device=${gpus}" --shm-size=4g -v ${KILN_GPU_MODEL}:/models/m:ro'
+VERIFY_CMD='
+R="\$(curl -fsS --max-time 600 -X POST "\$VERIFY_BASE_URL/v1/chat/completions" -H "content-type: application/json" -d "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"1+1=\"}],\"max_tokens\":16,\"temperature\":0}")"
+echo "chat: \$R" | cut -c1-300
+grep -q "\"content\"" <<<"\$R"
+docker logs "\$VERIFY_CONTAINER" 2>&1 | grep -F "[proj] 受保护模块接管启动"
+'
+EOF
+  } > "${p}/pack.conf"
+}
+
+scenario_sglang_one_gpu() {
+  write_sglang_service "${WORK}/sg1" sg1 "" "$GPU_ONE"
+  pack sg1
+  check_rc 0
+  check_log '接口探针通过'
+  check_log 'docker stop 后服务正常退出'
+  check_log '无明文: proj/launcher.py'
+  grep -E 'chat:|健康检查通过' "$LOG" | cut -c1-200 | sed 's/^/    /'
+}
+
+scenario_sglang_two_gpus() {
+  write_sglang_service "${WORK}/sg2" sg2 "--tp-size 2" "$IDS"
+  pack sg2
+  check_rc 0
+  check_log '接口探针通过'
+  check_log 'docker stop 后服务正常退出'
+  grep -E 'chat:|健康检查通过' "$LOG" | cut -c1-200 | sed 's/^/    /'
+}
+
 # ---------- 真实框架：只认配置路径、loss 带引号、短任务验收 ----------
 scenario_llamafactory_config_path() {
   local p="${WORK}/lora"
@@ -335,6 +401,9 @@ EOF
 ALL_SCENARIOS="
 torchrun_two_gpus accelerator_two_gpus serve_real_model serve_model_unreadable llamafactory_config_path
 "
+if [[ -n "${KILN_GPU_SGLANG_BASE:-}" ]]; then
+  ALL_SCENARIOS="${ALL_SCENARIOS} sglang_one_gpu sglang_two_gpus"
+fi
 
 BUSY="$(nvidia-smi --query-gpu=index,memory.used --format=csv,noheader,nounits | awk -F', *' -v ids=",${IDS}," 'index(ids, "," $1 ",") && $2 > 100 { print $1 }')"
 if [[ -n "$BUSY" ]]; then

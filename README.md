@@ -72,7 +72,8 @@ bash engine/pack.sh tests/demo-train
 已在 x86_64 + NVIDIA A30 + 带 CUDA torch 的非 root 底座、离线服务器上实测（`tests/acceptance_gpu.sh`）：
 
 - **serve**：加载真实模型的 FastAPI 服务，路由和 pydantic 模型编成 `.so` 后正常工作。
-  vLLM / SGLang 早期做过打包试验，但仓库里没有对应的配置和验收记录，也没有在这套流程上重跑，不能算验证过。
+  SGLang 0.5.23 在这套流程上试过（`tests/acceptance_gpu.sh` 的 sglang 场景），服务能起来，但真实推理还没跑通，见文末「目前没有解决的问题」。
+  vLLM 还没有在这套流程上测过。
 - **train**：`torchrun` 两卡 nccl、`Accelerator` 两卡混合精度、LlamaFactory 只认配置路径的 LoRA 训练，都配合编译保护和配置加密跑通了。
   `deepspeed` 只在 CPU 上验证过能拉起两个进程，`deepspeed.initialize` 和真实 GPU 的配合还没验证（在没有 `nvcc` 的底座上，它的安装就会失败）。
 - **还没验证**：昇腾 / CANN、其他厂商的卡、跨节点训练。
@@ -94,6 +95,33 @@ bash engine/pack.sh tests/demo-train
   最想保护的热点逻辑和最想被 compile 优化的往往是同一块，需按场景二选一。
 - `.so` 认平台和 Python 版本：builder 与 runtime 的架构、Python 版本必须一致。
 - 这是**抬高抄袭门槛**，不是绝对加密。要「逻辑绝对不可得」只能把算法留在自己服务器、对外只给 API。
+
+## 目前没有解决的问题
+
+**真实推理框架**
+
+- **SGLang 的真实推理没有跑通。** 在 A30、驱动 535 上测 SGLang 0.5.23（底座是手工拼的：靠 `cuda-compat` 13.2 跑 `torch 2.14.1+cu130`）。
+  受保护模块编成 `.so` 后能接管启动、加载权重，单卡和 `--tp-size 2` 双卡都走到了调度器；
+  但第一个推理请求触发 flashinfer 现场编译 GPU 代码，报 `Ninja build failed`，`/v1/chat/completions` 一次也没成功返回。
+  换了 13.0.88 的 `nvcc` 之后的具体错误还没查清，也还不能排除是手工拼的底座本身有问题（比如 SGLang 没钉 `nvidia-cuda-nvcc`，会解析到和头文件对不上的版本）。
+- **vLLM 没有测过。**
+- **要在运行时现场编译的框架和「编译器不进最终镜像」冲突。** 最新版 SGLang 的最终镜像里要有 `g++`、`nvcc` 和可写的编译缓存目录，
+  打包器不会替你准备，只能由底座提供；这一点 USAGE 里还没写。
+- **驱动太旧时要靠底座带 `cuda-compat`。** 驱动 535 只到 CUDA 12.2，新框架要前向兼容库，这也只能由底座解决。
+
+**打包器**
+
+- **builder 里装了 `cuda-compat` 时，import 自检会误判失败。** 自检遇到缺 GPU 驱动库（`libcuda.so.1` 这类）会跳过，
+  但装了 compat 库后报的是 `0 active drivers`，认不出来，打包直接失败。现在只能让 builder 用不带 compat 的底座绕开，还没有关闭 import 自检的开关。
+- **GPU 验收失败时，日志筛选挑不出编译器的错误行**，ninja / nvcc 的真实报错要自己翻完整日志。
+- **builder 只会用 `apt-get` 装编译器。** 底座自带 `gcc` 和 `Python.h` 时没问题；昇腾 EulerOS / openEuler 这类 `yum`/`dnf` 底座又没有编译器时会编译失败。
+- **不支持跨架构和跨 Python 版本**，builder 和 runtime 必须一致。
+- **`__init__.py` 不能编译，递归 glob 会命中它而失败**，`PROTECT_GLOBS` 实际上只能逐个文件列；`CONFIG_GLOBS` 也不支持 `**`。
+- **只保护 `.py`。** serve 的 YAML / JSON / 模板仍是明文；配置加密只有 train 有。
+
+**没验证过的环境**
+
+- `deepspeed` 和真实 GPU 的配合、昇腾 / CANN、其他厂商的卡、跨节点训练。
 
 ## 许可证
 

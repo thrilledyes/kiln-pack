@@ -49,6 +49,15 @@ def protected_entries(start_cmd, protected_rels):
     return hits
 
 
+def missing_gpu_driver(exc):
+    """这个 import 错误是不是因为缺 GPU 驱动的库。
+
+    这些库由驱动提供，运行时才挂进容器，docker build 里本来就没有。SGLang 的 sgl_kernel 这类
+    框架一 import 就要 libcuda.so.1，在 builder 里必定失败，但和编译产物好不好没有关系。
+    """
+    return re.search(r"lib(cuda|nvcuda|nvidia[-\w]*)\.so", str(exc)) is not None
+
+
 def check_entries(root, targets):
     start_cmd_file = os.path.join(root, ".kiln", "start_cmd.sh")
     if not os.path.exists(start_cmd_file):
@@ -142,18 +151,20 @@ def main():
 
     # import 自检：确保编译产物本身能被正常加载（不是语法上编过去就算完）。
     sys.path.insert(0, root)
+    passed = []
     for f in targets:
         rel = os.path.relpath(f, root)
         mod = os.path.splitext(rel)[0].replace(os.sep, ".")
         try:
             __import__(mod)
+            passed.append(mod)
         except Exception as e:  # noqa: BLE001
-            print(f"!! 自检失败：import {mod} 出错: {e}", file=sys.stderr)
-            sys.exit(5)
-    print("import 自检通过:", ", ".join(
-        os.path.splitext(os.path.relpath(f, root))[0].replace(os.sep, ".")
-        for f in targets
-    ))
+            if not missing_gpu_driver(e):
+                print(f"!! 自检失败：import {mod} 出错: {e}", file=sys.stderr)
+                sys.exit(5)
+            print(f"  [WARN] 构建阶段没有 GPU 驱动，跳过 {mod} 的 import 自检（{e}），要靠验收在有卡的容器里确认。")
+    if passed:
+        print("import 自检通过:", ", ".join(passed))
 
 
 if __name__ == "__main__":
