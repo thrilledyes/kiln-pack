@@ -53,13 +53,30 @@ HEALTHCHECK_CMD="python -c \"import urllib.request,sys; sys.exit(0 if urllib.req
 SECRET_MARKER="CHANGE_ME_UNIQUE_MARKER"   # 敏感常量别硬编码进源码
 REQUIRED_ENV="MY_SECRET"                  # 起服必需的环境变量，缺了拒绝启动
 VERIFY_ENV="MY_SECRET=whatever-for-verify"
+VERIFY_TIMEOUT="60"                       # 验收时等服务变健康的秒数，要加载模型的服务调大
+HEALTH_START_PERIOD="20s"                 # 容器启动后这段时间内健康检查失败不算数，比如 10m
+VERIFY_CMD='
+R="$(curl -fsS --max-time 30 "$VERIFY_BASE_URL/v1/models")"
+echo "$R"
+grep -q my-model <<<"$R"
+'
 ```
+
+- `HEALTHCHECK_CMD` 在容器内执行，通过前一直重试，直到 `VERIFY_TIMEOUT`。镜像里的 `HEALTHCHECK` 用的也是它。
+- `EXPOSE_PORT` 会写进镜像的 `EXPOSE`，也是验收时映射的端口。
+- 第 4 步的来源痕迹（`github.com` 和 `ORIGIN_MARKERS`）只查本次构建写入的内容，底座自带的 label 和构建历史不算。
+- `VERIFY_CMD` 是接口探针，健康检查通过后在打包机上用 `bash -euo pipefail` 执行一次，退出码非 0 判失败。
+  可以用 `$VERIFY_BASE_URL`（映射到本机的服务地址）、`$VERSION`、`$VERIFY_CONTAINER`（容器名）、`$PROJECT_DIR`。
+  探针写得长就放进脚本：`VERIFY_CMD='bash "$PROJECT_DIR/probe.sh"'`。写 `curl` 时记得带 `--max-time`。
+- **不写 `VERIFY_CMD` 也能通过验收，但只会给一条 `[WARN]`**：这时只确认了服务健康，没有验证接口和受保护逻辑。
+  引擎不再写死 `/healthz`、`/version`、`/infer`。以前靠这三个端点验收的项目，要把检查搬进 `VERIFY_CMD`，写法见 `tests/demo-fastapi/pack.conf`。
 
 ### 4. 打包 + 自动验收
 ```bash
 bash engine/pack.sh myproj
 ```
 两阶段构建 → 产出 `my-svc:1.0.0`，自动验收「源码看不见 + 服务正常起 + 可运维」。看到 `验收通过` 即成功。
+注意 `[WARN]`：它表示有一项没有验证到，比如没设 `SECRET_MARKER` 时跳过了机密标记扫描。
 
 ### 5. 导出 `.tar` 交付
 ```bash
@@ -178,6 +195,103 @@ docker run --rm \
 > `-e KILN_CONFIG_KEY` 只写名字，值取自当前 shell，不会留在命令历史里；没开配置加密就去掉这一行。
 
 ---
+
+## 用真实框架底座打包（serve 和 train 都适用）
+
+框架镜像常常是非 root 用户、带 CUDA、放在离线服务器上，下面这些项目就是为它准备的。
+
+**底座和离线环境**
+
+- 底座是非 root 用户也可以，构建时会切到 root，最终镜像再切回 `appuser`。
+- 底座自带 gcc 和 `Python.h` 时不跑 `apt-get`，已装 Cython 时不再下载。**离线环境要把 Cython 预装进 `BUILDER_BASE`**，可以从有网的机器下载 wheel 再 `COPY` 进去。
+- 底座的内容都会留在最终镜像里：底座自带的编译器、框架源码和目录都还在，验收也不扫它们。
+
+**验收用到 GPU 和模型**
+
+```bash
+VERIFY_DOCKER_ARGS='--gpus "device=2,3" -v /data/models/m:/models/m:ro'   # 按空格拆开，传给验收时的 docker run
+```
+
+指定多张卡时，`device=2,3` 外面的双引号不能省。写成 `--gpus device=2,3` 会报 `cannot set both Count and DeviceIDs`，逗号被 Docker 当成了分隔符。
+
+**模型目录读不了**
+
+容器默认以 uid 10001 运行。挂载的目录只有某个用户读得到时，有两种办法：
+
+```bash
+RUNTIME_UID="1036"   # 打包时指定运行用户，RUNTIME_GID 默认和它相同，不能用 root
+```
+
+或者运行时用 `docker run --user 1036:1036`。后者也可以，这时产物目录要挂载到一个这个 uid 写得了的地方。
+
+**缓存目录**
+
+启动时会检查 `HF_HOME`、`HF_HUB_CACHE`、`HF_DATASETS_CACHE`、`TRANSFORMERS_CACHE`、`MODELSCOPE_CACHE`、`TORCH_HOME`、`XDG_CACHE_HOME`、`TORCH_EXTENSIONS_DIR`、`TRITON_CACHE_DIR`，写不了的改到 `HOME` 下，并在日志里说明。写得了的不动。底座里预置了只读缓存、又确实要用时，运行时设 `KILN_KEEP_CACHE_ENV=1` 跳过这一步。
+
+**构建阶段没有 GPU 驱动**
+
+`docker build` 里没有 `libcuda.so.1` 这些驱动库。受保护模块 import 了一 import 就要它们的框架（比如 SGLang）时，自检会跳过并打印 `[WARN]`，这时要靠验收在有卡的容器里确认能加载，所以要配好 `VERIFY_DOCKER_ARGS` 和 `VERIFY_CMD`。其他 import 错误还是会让打包失败，`libcudart`、`libnuma` 这种由底座提供的库也一样，缺了说明底座没装好。
+
+**入口不能是受保护的模块**
+
+`python -m 受保护模块` 和 `python 受保护脚本.py` 跑不起来（`No code object available`），打包时就会报错。入口留明文，或者写成 `python -c "from 模块 import main; main()"`。
+
+**真实训练的验收（train）**
+
+验收默认把 `START_CMD` 完整跑一遍，真实训练跑不完。可以换成短任务，它只通过环境变量传给验收时的容器，不写进镜像：
+
+```bash
+VERIFY_START_CMD='python -m trainer.train --steps 20'
+LOSS_TAG="'loss': "    # 日志里 loss 的前缀，数值带不带引号都认得
+VERIFY_LOSS="off"      # loss 抖动、短任务不一定下降时可以关掉，默认 on，关了会警告
+```
+
+短任务也要读加密配置，不然「错误密钥时要失败」这项检查过不了。
+
+## 敏感文件（serve 和 train 都生效）
+
+这些文件默认不进镜像，打包时会逐个提示：
+
+- 环境变量文件：`*.env`、`.env.*`、`.envrc`
+- 密钥和证书：`*.pem`、`*.key`、`*.p12`、`*.pfx`、`*.jks`、`*.keystore`、`id_rsa`、`id_dsa`、`id_ecdsa`、`id_ed25519`
+- 凭据：`.netrc`、`.pypirc`、`.npmrc`、`pip.conf`、`.git-credentials`、`credentials.json`、`service-account*.json`
+- 凭据目录：`.ssh/`、`.aws/`、`.gnupg/`
+
+验收时如果在 `/app` 里发现命中规则的文件，会直接判失败。确实要随镜像发出的文件（比如公开的 CA 证书），逐个写完整路径：
+
+```bash
+PACK_KEEP="certs/ca.pem certs/intermediate.pem"   # 相对 SRC_DIR，不支持通配，凭据目录里的文件不能放行
+```
+
+这份规则只认文件名，查不出名字普通、内容却是密钥的文件，配置文件内容里的凭据也不在范围内。
+
+## 私有依赖
+
+`requirements`（包括它 `-r`、`-c` 引用的文件）和 `PIP_INSTALL_ARGS` 里，带账号密码或令牌的地址会在打包前被拒绝，因为它们会随镜像发出。
+报错只给文件和行号，不会把凭据打印出来。
+
+目前打包器不支持在构建时注入凭据。私有依赖的做法是提前下载成 wheel，放进源码目录：
+
+```bash
+pip download -d wheels --no-deps my-private-pkg==1.2.3   # 在有权限的机器上执行，平台要和镜像一致
+```
+```text
+# requirements.txt
+--find-links wheels
+my-private-pkg==1.2.3
+```
+
+`--find-links` 的路径相对 requirements 文件。这些 wheel 会进镜像，里面的代码没有编译保护。
+
+## 停止信号（serve 和 train 都生效）
+
+容器的 PID 1 是 `.kiln/kiln_init.py`，它把 `SIGTERM` 等信号转给作业的整个进程组，等整组退完才结束，并传回退出码。
+
+- **训练想在被抢占时存 checkpoint：** 在代码里装 `SIGTERM` 处理函数。没装的话，作业收到信号就直接退出。
+- **处理函数最好能重复进入：** 启动器自己也可能转发信号。CPU 上 `torchrun` 两进程实测每个 worker 只收到一次，`deepspeed` 和 `accelerate` 没有测过。
+- **退出码看启动器：** `single` 存完正常退出时是 0；`torchrun` 被停止时实测是 1，就算 worker 都存完了也一样。判断有没有存完要看产物，别只看退出码。
+- **留够退出时间：** `docker stop` 默认的等待时间不够存 checkpoint，要用 `docker stop -t 120` 这样显式给够，K8s 对应 `terminationGracePeriodSeconds`。
+- **验收：** 会真的 `docker stop` 一次，退出码 137 判失败。收尾慢的服务调大 `VERIFY_STOP_TIMEOUT`（默认 30 秒）。
 
 ## 依赖安装加固（可选，serve 和 train 都能用）
 

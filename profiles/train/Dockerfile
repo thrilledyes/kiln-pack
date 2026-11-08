@@ -20,13 +20,19 @@ FROM ${BUILDER_BASE} AS builder
 ARG PROTECT_GLOBS=""
 ARG PIP_REQUIREMENTS=""
 ARG PIP_INSTALL_ARGS=""
+# 框架镜像常用非 root 用户，装包和编译都要 root。最终镜像在后面切回 appuser。
+USER root
+# 底座自带编译器和头文件时不用装，离线环境也能过；Cython 同理。
 RUN set -eux; \
-    if command -v apt-get >/dev/null 2>&1; then \
-      apt-get update; \
-      apt-get install -y --no-install-recommends gcc g++ binutils python3-dev; \
-      rm -rf /var/lib/apt/lists/*; \
+    if ! command -v gcc >/dev/null 2>&1 \
+       || ! python -c "import os,sys,sysconfig; sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path('include'),'Python.h')) else 1)"; then \
+      if command -v apt-get >/dev/null 2>&1; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends gcc g++ binutils python3-dev; \
+        rm -rf /var/lib/apt/lists/*; \
+      fi; \
     fi
-RUN pip install --no-cache-dir Cython
+RUN python -c "import Cython" 2>/dev/null || pip install --no-cache-dir Cython
 COPY .kiln/pip-requirements.txt /tmp/kiln-requirements.txt
 RUN set -eux; \
     if [ -s /tmp/kiln-requirements.txt ]; then \
@@ -54,6 +60,9 @@ RUN rm -f /src/.kiln/compile_protect.py /src/.kiln/pip-requirements.txt
 
 # ---------- runtime ----------
 FROM ${RUNTIME_BASE} AS runtime
+# 构建起点标记：验收查来源痕迹时，只看它之后的构建历史，底座自带的不算。
+LABEL kiln.runtime.begin="1"
+USER root
 # 必须排在 KILN_BUILD_ID 之前：它每次构建都变，后面的 RUN 都会隐式带上它，缓存全部失效。
 ARG CONFIG_ENCRYPT=off
 ARG PIP_INSTALL_ARGS=""
@@ -75,6 +84,9 @@ ARG KILN_BUILT_AT=unknown
 ARG PIP_REQUIREMENTS=""
 # 容器内产物目录（checkpoint/日志）。运行时用 -v 挂到宿主；默认 /workspace/output。
 ARG KILN_OUTPUT_DIR=/workspace/output
+# 运行用户的 uid/gid。挂载的模型或数据目录权限严时，改成读得到的 uid（pack.conf 的 RUNTIME_UID）。
+ARG KILN_UID=10001
+ARG KILN_GID=10001
 ENV PYTHONPATH=/app/.kiln/lib${PYTHONPATH:+:${PYTHONPATH}}
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -103,7 +115,8 @@ RUN set -eux; \
 # 代码 /app 仍只读（a+rX，不给写）；训练需要写的只有产物目录和框架缓存，
 # 它们建在 appuser 的可写路径下，与只读代码分离。
 # 构建上下文（mktemp -d 0700 + rsync）目录权限不含 others 位，切非 root 前先放开 /app 只读访问。
-RUN useradd -u 10001 -m -d /home/appuser -s /usr/sbin/nologin appuser \
+RUN groupadd -o -g "${KILN_GID}" appuser \
+ && useradd -o -u "${KILN_UID}" -g "${KILN_GID}" -m -d /home/appuser -s /usr/sbin/nologin appuser \
  && chmod -R a+rX /app \
  && mkdir -p "${KILN_OUTPUT_DIR}" "${HF_HOME}" "${TORCH_EXTENSIONS_DIR}" "${TRITON_CACHE_DIR}" \
  && chown -R appuser:appuser "${KILN_OUTPUT_DIR}" /home/appuser

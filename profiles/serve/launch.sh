@@ -22,4 +22,12 @@ if [ -f "$REQ_LIST" ]; then
   fi
 fi
 
-exec /bin/sh /app/.kiln/start_cmd.sh
+. /app/.kiln/runtime_env.sh
+
+# kiln_init 当 PID 1，docker stop 的信号才到得了服务。详见 kiln_init.py。
+KILN_PY="$(command -v python || command -v python3 || true)"
+if [ -z "${KILN_PY}" ]; then
+  echo "[kiln] 找不到 python，无法转发停止信号，docker stop 时服务可能被强杀。" >&2
+  exec /bin/sh /app/.kiln/start_cmd.sh
+fi
+exec "${KILN_PY}" -I -S /app/.kiln/kiln_init.py /bin/sh /app/.kiln/start_cmd.sh

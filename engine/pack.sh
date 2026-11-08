@@ -14,6 +14,8 @@ set -euo pipefail
 
 ENGINE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${ENGINE_DIR}/.." && pwd)"
+# shellcheck disable=SC1091
+source "${ENGINE_DIR}/sensitive.sh"
 
 if [ $# -lt 1 ]; then
   echo "用法: $0 <项目目录，含 pack.conf> [额外 docker build 参数...]" >&2
@@ -56,14 +58,32 @@ PIP_REQUIREMENTS="${PIP_REQUIREMENTS:-}"
 # 透传给 pip install -r 的额外参数，默认空。比如 --require-hashes、--only-binary :all:。
 PIP_INSTALL_ARGS="${PIP_INSTALL_ARGS:-}"
 # 这个值走 --build-arg，会留在镜像历史里，所以带账号密码的索引地址不能写在这里。
-case "$PIP_INSTALL_ARGS" in
-  *://*@*)
-    echo "!! PIP_INSTALL_ARGS 不能带账号密码（它会留在镜像历史里），请改用 pip.conf 或 secret 挂载。" >&2
-    exit 2
-    ;;
-  *) ;;
-esac
+if [[ -n "$(printf '%s\n' "$PIP_INSTALL_ARGS" | kiln_lines_with_url_credentials)" ]]; then
+  echo "!! PIP_INSTALL_ARGS 不能带账号密码（它会留在镜像历史里）。私有依赖的安全做法见 USAGE「私有依赖」。" >&2
+  exit 2
+fi
 EXPOSE_PORT="${EXPOSE_PORT:-8000}"
+if [[ ! "$EXPOSE_PORT" =~ ^[0-9]+$ ]]; then
+  echo "!! EXPOSE_PORT 必须是端口号（当前 ${EXPOSE_PORT}）。" >&2
+  exit 2
+fi
+# 运行用户的 uid/gid。挂载的模型或数据目录只有某个用户读得到时，改成那个 uid。不允许 root。
+RUNTIME_UID="${RUNTIME_UID:-10001}"
+RUNTIME_GID="${RUNTIME_GID:-$RUNTIME_UID}"
+if [[ ! "$RUNTIME_UID" =~ ^[1-9][0-9]*$ || ! "$RUNTIME_GID" =~ ^[1-9][0-9]*$ ]]; then
+  echo "!! RUNTIME_UID / RUNTIME_GID 必须是正整数，不能用 root（当前 ${RUNTIME_UID}:${RUNTIME_GID}）。" >&2
+  exit 2
+fi
+if [[ "${VERIFY_LOSS:-on}" != on && "${VERIFY_LOSS:-on}" != off ]]; then
+  echo "!! 未知 VERIFY_LOSS='${VERIFY_LOSS}'。支持: on | off。" >&2
+  exit 2
+fi
+# 容器启动后这段时间内健康检查失败不算数。要加载模型的服务调大，比如 10m。
+HEALTH_START_PERIOD="${HEALTH_START_PERIOD:-20s}"
+if [[ ! "$HEALTH_START_PERIOD" =~ ^[0-9]+(s|m|h)$ ]]; then
+  echo "!! HEALTH_START_PERIOD 要写成 600s、10m 这样（当前 ${HEALTH_START_PERIOD}）。" >&2
+  exit 2
+fi
 HEALTHCHECK_CMD="${HEALTHCHECK_CMD:-true}"
 SECRET_MARKER="${SECRET_MARKER:-}"
 REQUIRED_ENV="${REQUIRED_ENV:-}"
@@ -109,6 +129,44 @@ case "$CONFIG_ENCRYPT" in
 esac
 
 SRC_ABS="$(cd "${PROJECT_DIR}/${SRC_DIR}" && pwd)"
+
+# 敏感文件默认不进构建上下文。确实要随镜像发出的（比如公开的 CA 证书）逐个写进 PACK_KEEP，
+# 只接受相对 SRC_DIR 的完整路径，不接受通配，免得一条规则把私钥也放行了。
+PACK_KEEP="${PACK_KEEP:-}"
+KEEP_ARGS=()
+# requirements 会随镜像发出，里面的凭据等于直接交给拿到镜像的人。
+if [[ -n "$PIP_REQUIREMENTS" ]]; then
+  REQ_CREDS="$(cd "$SRC_ABS" && kiln_requirements_credentials "$PIP_REQUIREMENTS")"
+  if [[ -n "$REQ_CREDS" ]]; then
+    echo "!! 这些位置的地址带账号密码或令牌，它们会随镜像发出（私有依赖的安全做法见 USAGE「私有依赖」）:" >&2
+    printf '%s\n' "$REQ_CREDS" | sed 's/^/    /' >&2
+    exit 2
+  fi
+fi
+set -f
+for rel in $PACK_KEEP; do
+  case "$rel" in
+    /*|..|../*|*/..|*/../*|*'*'*|*'?'*|*'['*)
+      echo "!! PACK_KEEP 只接受源码目录内的完整相对路径: ${rel}" >&2
+      exit 2
+      ;;
+    *) ;;
+  esac
+  if [[ ! -f "${SRC_ABS}/${rel}" || -L "${SRC_ABS}/${rel}" ]]; then
+    echo "!! PACK_KEEP 里的 '${rel}' 不是源码目录内的普通文件。" >&2
+    exit 2
+  fi
+  if ! kiln_sensitive_match "$rel"; then
+    echo "!! PACK_KEEP 里的 '${rel}' 没有命中敏感规则，不需要放行。" >&2
+    exit 2
+  fi
+  if kiln_sensitive_in_dir "$rel"; then
+    echo "!! ${rel} 在凭据目录里，不能放行，请把要发布的文件挪到别处。" >&2
+    exit 2
+  fi
+  KEEP_ARGS+=("--include=/${rel}")
+done
+set +f
 
 # 展开 CONFIG_GLOBS，每行输出一个相对路径。任何一条有问题都中止，宁可打包失败也不让明文漏进镜像。
 expand_config_globs() (
@@ -182,12 +240,25 @@ echo
 # 用临时构建上下文，避免污染/依赖源码目录本身的 .dockerignore 之类的东西，
 # 也方便把 .git、证据目录等排除在外。
 BUILD_CTX="$(mktemp -d)"
-trap 'rm -rf "$BUILD_CTX"' EXIT
+RENDERED_DOCKERFILE="$(mktemp)"
+trap 'rm -rf "$BUILD_CTX" "$RENDERED_DOCKERFILE"' EXIT
 
-echo "-- 1/3 复制构建上下文（排除 .git / 证据目录 / 预编译产物）"
+echo "-- 1/3 复制构建上下文（排除 .git / 证据目录 / 预编译产物 / 敏感文件）"
+DROPPED="$(cd "$SRC_ABS" && find . -name .git -prune -o \( "${KILN_SENSITIVE_FIND_ARGS[@]}" \) -print 2>/dev/null | sed 's|^\./||' || true)"
+if [[ -n "$DROPPED" ]]; then
+  while IFS= read -r rel; do
+    case " $(printf '%s' "$PACK_KEEP" | tr '\n\t' '  ') " in
+      *" ${rel} "*) echo "  [WARN] PACK_KEEP 放行，这个敏感文件会进镜像: ${rel}" >&2 ;;
+      *) echo "  [WARN] 敏感文件不会进镜像（确实要带上就写进 PACK_KEEP）: ${rel}" >&2 ;;
+    esac
+  done <<<"$DROPPED"
+fi
 # 排除源码树里的预编译产物（.so/.pyd/.pyc）：它们应在 builder 阶段由 .py 重新编译。
 # 源树里的旧 .so 会被原样带进镜像，可能残留已从 .py 删除的旧密钥（这个坑踩过，见教程）。
+# rsync 按顺序取第一条匹配的规则，所以 PACK_KEEP 要排在所有排除规则前面。
 rsync -a \
+  ${KEEP_ARGS[@]+"${KEEP_ARGS[@]}"} \
+  "${KILN_SENSITIVE_RSYNC_ARGS[@]}" \
   --exclude='.git' \
   --exclude='.git/***' \
   --exclude='evidence/***' \
@@ -245,6 +316,9 @@ if [ "$PROFILE" = train ]; then
 fi
 # 公共：编译保护助手（builder 阶段用）
 cp "${ENGINE_DIR}/compile_protect.py" "${BUILD_CTX}/.kiln/compile_protect.py"
+# 公共：容器的 PID 1（把停止信号转给作业），以及启动前的环境检查
+cp "${ENGINE_DIR}/kiln_init.py" "${BUILD_CTX}/.kiln/kiln_init.py"
+cp "${ENGINE_DIR}/runtime_env.sh" "${BUILD_CTX}/.kiln/runtime_env.sh"
 # profile 专属：启动入口 +（serve 才有的）健康检查入口
 cp "${PROFILE_DIR}/launch.sh" "${BUILD_CTX}/.kiln/launch.sh"
 if [ -f "${PROFILE_DIR}/healthcheck.sh" ]; then
@@ -258,17 +332,21 @@ printf '%s\n' ${REQUIRED_ENV:-} > "${BUILD_CTX}/.kiln/required_env.list"
 set +f
 [ "$CONFIG_ENCRYPT" = on ] && echo KILN_CONFIG_KEY >> "${BUILD_CTX}/.kiln/required_env.list"
 # profile 运行期配置（launch.sh 在镜像内用 /bin/sh source 它决定怎么起）。
-# 用单引号包值，保证 POSIX sh 能安全 source；值本身别含单引号（路径/启动器名不会有）。
+# 启动器参数是用户写的自由文本，可能带单引号，转义后才能安全 source。
+sh_quote() {
+  local value="$1"
+  printf "'%s'" "$(printf '%s' "$value" | sed "s/'/'\\\\''/g")"
+}
 {
-  printf 'PROFILE=%s\n' "$PROFILE"
-  printf 'LAUNCHER=%s\n' "$LAUNCHER"
-  printf 'NPROC_PER_NODE=%s\n' "$NPROC_PER_NODE"
-  printf "TORCHRUN_ARGS='%s'\n" "$TORCHRUN_ARGS"
-  printf "DEEPSPEED_ARGS='%s'\n" "$DEEPSPEED_ARGS"
-  printf "ACCELERATE_ARGS='%s'\n" "$ACCELERATE_ARGS"
-  printf "OUTPUT_DIR='%s'\n" "$OUTPUT_DIR"
-  printf 'CONFIG_ENCRYPT=%s\n' "$CONFIG_ENCRYPT"
-  printf "CONFIG_MATERIALIZE='%s'\n" "$CONFIG_MATERIALIZE"
+  printf 'PROFILE=%s\n' "$(sh_quote "$PROFILE")"
+  printf 'LAUNCHER=%s\n' "$(sh_quote "$LAUNCHER")"
+  printf 'NPROC_PER_NODE=%s\n' "$(sh_quote "$NPROC_PER_NODE")"
+  printf 'TORCHRUN_ARGS=%s\n' "$(sh_quote "$TORCHRUN_ARGS")"
+  printf 'DEEPSPEED_ARGS=%s\n' "$(sh_quote "$DEEPSPEED_ARGS")"
+  printf 'ACCELERATE_ARGS=%s\n' "$(sh_quote "$ACCELERATE_ARGS")"
+  printf 'OUTPUT_DIR=%s\n' "$(sh_quote "$OUTPUT_DIR")"
+  printf 'CONFIG_ENCRYPT=%s\n' "$(sh_quote "$CONFIG_ENCRYPT")"
+  printf 'CONFIG_MATERIALIZE=%s\n' "$(sh_quote "$CONFIG_MATERIALIZE")"
 } > "${BUILD_CTX}/.kiln/profile.conf"
 chmod +x "${BUILD_CTX}/.kiln/"*.sh
 
@@ -286,15 +364,21 @@ BUILD_ARGS=(
   --build-arg KILN_VERSION="$VERSION"
   --build-arg KILN_BUILD_ID="$BUILD_ID"
   --build-arg KILN_BUILT_AT="$BUILT_AT"
+  --build-arg KILN_UID="$RUNTIME_UID"
+  --build-arg KILN_GID="$RUNTIME_GID"
 )
 # train runtime 需要一个可写产物目录；serve 的 Dockerfile 不声明该 arg，故仅 train 传。
 if [ "$PROFILE" = train ]; then
   BUILD_ARGS+=(--build-arg KILN_OUTPUT_DIR="$OUTPUT_DIR" --build-arg CONFIG_ENCRYPT="$CONFIG_ENCRYPT")
+else
+  BUILD_ARGS+=(--build-arg EXPOSE_PORT="$EXPOSE_PORT")
 fi
+# HEALTHCHECK 的选项不支持 ARG 变量，只能在构建前把值写进 Dockerfile。值在前面已经校验过格式。
+sed "s/--start-period=[0-9a-z]*/--start-period=${HEALTH_START_PERIOD}/" "${PROFILE_DIR}/Dockerfile" > "$RENDERED_DOCKERFILE"
 
 docker build \
   "${BUILD_ARGS[@]}" \
-  -f "${PROFILE_DIR}/Dockerfile" \
+  -f "$RENDERED_DOCKERFILE" \
   -t "$IMAGE_TAG" \
   ${EXTRA_BUILD_ARGS[@]+"${EXTRA_BUILD_ARGS[@]}"} \
   "$BUILD_CTX"

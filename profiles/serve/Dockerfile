@@ -14,13 +14,19 @@ FROM ${BUILDER_BASE} AS builder
 ARG PROTECT_GLOBS=""
 ARG PIP_REQUIREMENTS=""
 ARG PIP_INSTALL_ARGS=""
+# 框架镜像常用非 root 用户，装包和编译都要 root。最终镜像在后面切回 appuser。
+USER root
+# 底座自带编译器和头文件时不用装，离线环境也能过；Cython 同理。
 RUN set -eux; \
-    if command -v apt-get >/dev/null 2>&1; then \
-      apt-get update; \
-      apt-get install -y --no-install-recommends gcc g++ binutils python3-dev; \
-      rm -rf /var/lib/apt/lists/*; \
+    if ! command -v gcc >/dev/null 2>&1 \
+       || ! python -c "import os,sys,sysconfig; sys.exit(0 if os.path.exists(os.path.join(sysconfig.get_path('include'),'Python.h')) else 1)"; then \
+      if command -v apt-get >/dev/null 2>&1; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends gcc g++ binutils python3-dev; \
+        rm -rf /var/lib/apt/lists/*; \
+      fi; \
     fi
-RUN pip install --no-cache-dir Cython
+RUN python -c "import Cython" 2>/dev/null || pip install --no-cache-dir Cython
 WORKDIR /src
 COPY . /src
 # 去掉可能混进来的 VCS / 字节码缓存
@@ -39,12 +45,19 @@ RUN rm -f /src/.kiln/compile_protect.py
 
 # ---------- runtime ----------
 FROM ${RUNTIME_BASE} AS runtime
+# 构建起点标记：验收查来源痕迹时，只看它之后的构建历史，底座自带的不算。
+LABEL kiln.runtime.begin="1"
+USER root
 ARG KILN_APP=app
 ARG KILN_VERSION=dev
 ARG KILN_BUILD_ID=unknown
 ARG KILN_BUILT_AT=unknown
 ARG PIP_REQUIREMENTS=""
 ARG PIP_INSTALL_ARGS=""
+ARG EXPOSE_PORT=8000
+# 运行用户的 uid/gid。挂载的模型目录权限严时，改成读得到的 uid（pack.conf 的 RUNTIME_UID）。
+ARG KILN_UID=10001
+ARG KILN_GID=10001
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     KILN_APP=${KILN_APP} \
@@ -65,16 +78,19 @@ RUN set -eux; \
     fi
 # 非 root 运行：抬高同容器内 ptrace / 读 /proc/<pid>/mem 等攻击的门槛。
 # 依赖已在上面以 root 装好，运行期只读执行 /app，不需要写权限。
-# 注：需要写缓存目录或访问设备（如 GPU）的框架，后续用 pack.conf 开关放宽。
+# 注：框架的缓存默认写在 HOME（/home/appuser，可写）下，底座指向别处又写不了的由 launch.sh 改到 HOME 下。
 # 构建上下文（mktemp -d 0700 + rsync）目录权限不含 others 位，
 # 切非 root 前先给 /app 放开只读访问（a+rX：只加读和目录执行位，不给写）。
-RUN useradd -u 10001 -m -d /home/appuser -s /usr/sbin/nologin appuser \
+RUN groupadd -o -g "${KILN_GID}" appuser \
+ && useradd -o -u "${KILN_UID}" -g "${KILN_GID}" -m -d /home/appuser -s /usr/sbin/nologin appuser \
  && chmod -R a+rX /app
 USER appuser
 LABEL kiln.app="${KILN_APP}" \
       kiln.version="${KILN_VERSION}" \
       kiln.build_id="${KILN_BUILD_ID}" \
       kiln.built_at="${KILN_BUILT_AT}"
+EXPOSE ${EXPOSE_PORT}
+# --start-period 由 pack.sh 按 HEALTH_START_PERIOD 改写，这里的值是默认值。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD ["/bin/sh", "/app/.kiln/healthcheck.sh"]
 ENTRYPOINT ["/bin/sh", "/app/.kiln/launch.sh"]

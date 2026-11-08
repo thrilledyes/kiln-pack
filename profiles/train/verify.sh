@@ -8,10 +8,15 @@
 set -uo pipefail
 
 PROJECT_DIR="$(cd "${1:?用法: verify.sh <项目目录>}" && pwd)"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../engine" && pwd)/sensitive.sh"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../engine" && pwd)/verify_lib.sh"
 # shellcheck disable=SC1090
 source "$PROJECT_DIR/pack.conf"
 TAG="${APP_NAME}:${VERSION}"
 ORIGIN_MARKERS="${ORIGIN_MARKERS:-}"
+VERIFY_STOP_TIMEOUT="${VERIFY_STOP_TIMEOUT:-30}"  # docker stop 后等作业退出的秒数
 # 训练验收相关项（可在 pack.conf 覆盖）
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/output}"   # 容器内产物目录
 CKPT_GLOB="${CKPT_GLOB:-*.pt}"                   # 验收期望落下的 checkpoint（相对 OUTPUT_DIR）
@@ -23,7 +28,16 @@ bad()  { echo "  [FAIL] $*"; FAIL=1; }
 
 # 产物挂载目录、作业日志和镜像层解包目录都是临时文件，脚本中途失败也要清掉（踩过：日志漏在 $TMPDIR）。
 HOST_OUT=""; RUN_LOG=""; SCAN_DIR=""
-cleanup() { rm -rf "${HOST_OUT:-/nonexistent-kiln}" "${RUN_LOG:-/nonexistent-kiln}" "${SCAN_DIR:-/nonexistent-kiln}"; }
+STOP_NAME="kiln-verify-stop-$$"
+cleanup() {
+  docker rm -fv "$STOP_NAME" >/dev/null 2>&1 || true
+  # 作业以容器用户写的子目录，打包机上的用户删不掉，先用 root 在容器里清掉。
+  if [[ -n "$HOST_OUT" && -d "$HOST_OUT" ]]; then
+    docker run --rm --user 0 --network none --entrypoint /bin/sh -v "$HOST_OUT:/kiln-out" "$TAG" \
+      -c 'rm -rf /kiln-out/* /kiln-out/.[!.]*' >/dev/null 2>&1 || true
+  fi
+  rm -rf "${HOST_OUT:-/nonexistent-kiln}" "${RUN_LOG:-/nonexistent-kiln}" "${SCAN_DIR:-/nonexistent-kiln}"
+}
 trap cleanup EXIT
 
 sha256_of() {
@@ -50,6 +64,8 @@ KILN_PROT_EOF
 fi
 if echo "$LISTING" | grep -qE '\.(c|pyx)$'; then bad "镜像里有 .c/.pyx 中间产物"; else ok "无 .c/.pyx 中间产物"; fi
 if echo "$LISTING" | grep -q 'pack.conf'; then bad "镜像里有 pack.conf"; else ok "无 pack.conf"; fi
+SENSITIVE_HITS="$(kiln_sensitive_in_listing "$LISTING" "${PACK_KEEP:-}")"
+if [[ -n "$SENSITIVE_HITS" ]]; then bad "镜像里有敏感文件（确实要带上就写进 PACK_KEEP）:"; echo "$SENSITIVE_HITS" | sed 's/^/    /'; else ok "无敏感文件"; fi
 
 echo "== 3. 应用层扫描机密标记 =="
 # 聚焦 /app（受保护代码、.so、.kiln、产物）：机密只可能从项目代码/交付物泄漏，
@@ -65,15 +81,14 @@ if [ -n "${SECRET_MARKER:-}" ]; then
   else ok "静态交付物中无此敏感值——已外置为运行时注入"; fi
   echo "  [i] 边界：作业运行后该值会驻留进程内存，dump /proc/<pid>/mem 仍可取回；env 外置只保证不随镜像发出。"
 else
-  echo "  [i] 未设 SECRET_MARKER，跳过机密扫描。"
+  echo "  [WARN] 没设 SECRET_MARKER，跳过机密标记扫描，这一项没有验证过。"
 fi
 if echo "$LISTING" | grep -q '/app/.git'; then bad "镜像里有 .git"; else ok "无 .git"; fi
 
 echo "== 4. 镜像元数据不含来源痕迹 =="
+kiln_check_origin "$TAG" "$ORIGIN_MARKERS"
+# 配置明文和密钥不管从哪来都不能出现，后面的配置加密检查看全部元数据。
 META="$(docker inspect "$TAG"; docker history --no-trunc "$TAG")"
-ORIGIN_PAT='github\.com'
-for m in $ORIGIN_MARKERS; do ORIGIN_PAT="${ORIGIN_PAT}|${m}"; done
-if echo "$META" | grep -qiE "$ORIGIN_PAT"; then bad "元数据里有来源痕迹（匹配 /$ORIGIN_PAT/）"; else ok "元数据无来源痕迹"; fi
 
 echo "== 5. 冒烟训练：正常退出 + 落下 checkpoint + loss 有限且下降 =="
 # 敏感 env 由验收侧注入（真实部署由运维提供，不随镜像发出）；缺了 launch.sh 会拒绝起训。
@@ -82,11 +97,19 @@ for kv in ${VERIFY_ENV:-}; do ENV_ARGS+=(-e "$kv"); done
 # 配置密钥只按名字传给 docker，不写进命令行。
 KEY_ARGS=()
 [ "${CONFIG_ENCRYPT:-off}" = on ] && KEY_ARGS=(-e KILN_CONFIG_KEY)
-# 产物挂载到宿主临时目录；非 root 容器（uid 10001）要能写，放开 others 写位。
+# VERIFY_START_CMD：验收时跑的短任务，真实训练跑不完一次冒烟。只通过环境变量传给容器，不写进镜像。
+SMOKE_ARGS=()
+if [[ -n "${VERIFY_START_CMD:-}" ]]; then
+  SMOKE_ARGS=(-e "KILN_VERIFY_START_CMD=${VERIFY_START_CMD}")
+  echo "    验收用短任务: ${VERIFY_START_CMD}"
+fi
+# 产物挂载到宿主临时目录；非 root 容器要能写，放开 others 写位。
 HOST_OUT="$(mktemp -d)"; chmod 777 "$HOST_OUT"
 echo "    产物挂载: $HOST_OUT -> $OUTPUT_DIR"
 RUN_LOG="$(mktemp)"
-docker run --rm ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} -v "$HOST_OUT:$OUTPUT_DIR" "$TAG" 2>&1 | tee "$RUN_LOG"
+# VERIFY_DOCKER_ARGS：验收时多传给 docker run 的参数，比如 --gpus、模型或数据目录的 -v。
+# shellcheck disable=SC2086
+docker run --rm ${VERIFY_DOCKER_ARGS:-} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} ${SMOKE_ARGS[@]+"${SMOKE_ARGS[@]}"} -v "$HOST_OUT:$OUTPUT_DIR" "$TAG" 2>&1 | tee "$RUN_LOG"
 RC="${PIPESTATUS[0]}"
 echo "    作业退出码: $RC"
 if [ "$RC" -eq 0 ]; then ok "训练作业正常退出（码 0）"; else bad "训练作业异常退出（码 ${RC}）"; fi
@@ -99,9 +122,12 @@ fi
 CKPTS="$(cd "$HOST_OUT" 2>/dev/null && ls -1 $CKPT_GLOB 2>/dev/null)"
 if [ -n "$CKPTS" ]; then ok "产物目录落下 checkpoint: $(echo "$CKPTS" | tr '\n' ' ')"; else bad "产物目录没有匹配 '$CKPT_GLOB' 的 checkpoint"; fi
 
-# loss 趋势：抓日志里所有 loss=数值，判首末有限且不升
-LOSSES="$(grep -oE "${LOSS_TAG}[-+0-9.eEnafiNAFI]+" "$RUN_LOG" | sed "s/${LOSS_TAG}//" )"
-if [ -n "$LOSSES" ]; then
+# loss 趋势：抓日志里所有 loss=数值，判首末有限且不升。数值可以带引号（transformers 5 打印 {'loss': '1.23'}）。
+# 真实训练的 loss 会抖动，短任务不一定下降，可以用 VERIFY_LOSS="off" 关掉这项。
+LOSSES="$(grep -oE "${LOSS_TAG}['\"]?[-+0-9.eEnafiNAFI]+" "$RUN_LOG" | sed "s/${LOSS_TAG}//; s/^['\"]//" )"
+if [[ "${VERIFY_LOSS:-on}" == off ]]; then
+  echo "  [WARN] VERIFY_LOSS=off，跳过 loss 检查，这一项没有验证过。"
+elif [ -n "$LOSSES" ]; then
   FIRST_L="$(echo "$LOSSES" | head -n1)"; LAST_L="$(echo "$LOSSES" | tail -n1)"
   echo "    loss first=${FIRST_L} last=${LAST_L}"
   # 变量一律用 ${} 包：避免后面紧贴多字节字符时被某些 bash 吞进变量名（踩过）。
@@ -143,7 +169,8 @@ $CONFIG_LIST
 KILN_CONFIG_EOF
 
   # 缺密钥：launch.sh 应在起训前拒绝。
-  NOKEY_LOG="$(docker run --rm ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} "$TAG" 2>&1)"; NOKEY_RC=$?
+  # shellcheck disable=SC2086
+  NOKEY_LOG="$(docker run --rm ${VERIFY_DOCKER_ARGS:-} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} "$TAG" 2>&1)"; NOKEY_RC=$?
   if [ "$NOKEY_RC" -ne 0 ] && echo "$NOKEY_LOG" | grep -qF '缺少必需环境变量: KILN_CONFIG_KEY'; then
     ok "没有密钥时拒绝起训（码 ${NOKEY_RC}）"
   else
@@ -151,7 +178,8 @@ KILN_CONFIG_EOF
   fi
   # 错密钥：作业必须解密失败。如果还能跑通，说明作业根本没读加密配置。
   WRONG_KEY="$(head -c 32 /dev/urandom | base64)"
-  WRONG_LOG="$(docker run --rm ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} -e "KILN_CONFIG_KEY=${WRONG_KEY}" "$TAG" 2>&1)"; WRONG_RC=$?
+  # shellcheck disable=SC2086
+  WRONG_LOG="$(docker run --rm ${VERIFY_DOCKER_ARGS:-} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${SMOKE_ARGS[@]+"${SMOKE_ARGS[@]}"} -e "KILN_CONFIG_KEY=${WRONG_KEY}" -v "$HOST_OUT:$OUTPUT_DIR" "$TAG" 2>&1)"; WRONG_RC=$?
   if [ "$WRONG_RC" -ne 0 ] && echo "$WRONG_LOG" | grep -qF '解密失败'; then
     ok "错误密钥时解密失败，作业中止（码 ${WRONG_RC}）"
   elif [ "$WRONG_RC" -eq 0 ]; then
@@ -220,6 +248,35 @@ if [ -n "$FIRST_PROT" ]; then
     ok "容器内 cat 源码失败（符合预期）: /app/${FIRST_PROT}"
   fi
 fi
+
+echo "== 8. 停止信号 =="
+# 被抢占或 docker stop 时作业要收得到 SIGTERM，否则来不及存 checkpoint。退出码 137 说明是被 SIGKILL 杀掉的。
+# shellcheck disable=SC2086
+docker run -d --name "$STOP_NAME" ${VERIFY_DOCKER_ARGS:-} ${ENV_ARGS[@]+"${ENV_ARGS[@]}"} ${KEY_ARGS[@]+"${KEY_ARGS[@]}"} ${SMOKE_ARGS[@]+"${SMOKE_ARGS[@]}"} -v "$HOST_OUT:$OUTPUT_DIR" "$TAG" >/dev/null
+SECONDS=0
+while [[ "$SECONDS" -lt 60 ]]; do
+  STOP_LOG="$(docker logs "$STOP_NAME" 2>&1)"
+  # 带冒号才算：拒绝起训的提示是「[kiln] 起训中止」。
+  if [[ "$STOP_LOG" == *'[kiln] 起训: '* || "$(docker inspect -f '{{.State.Running}}' "$STOP_NAME" 2>/dev/null)" != true ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$(docker inspect -f '{{.State.Running}}' "$STOP_NAME" 2>/dev/null)" == true ]]; then
+  docker stop -t "$VERIFY_STOP_TIMEOUT" "$STOP_NAME" >/dev/null 2>&1
+  STOP_RC="$(docker inspect -f '{{.State.ExitCode}}' "$STOP_NAME" 2>/dev/null)"
+  if [[ "$STOP_RC" == 137 ]]; then
+    bad "docker stop 后作业被强杀（码 137）：没收到 SIGTERM，或 ${VERIFY_STOP_TIMEOUT} 秒内没退出（可调 VERIFY_STOP_TIMEOUT）"
+  else
+    ok "docker stop 后作业正常退出（码 ${STOP_RC}）"
+  fi
+elif [[ "$(docker logs "$STOP_NAME" 2>&1)" == *'[kiln] 起训: '* ]]; then
+  echo "  [i] 作业太短，在发出停止信号之前就结束了，这一项没有验证到。"
+else
+  bad "作业没有起来，无法验证停止信号（码 $(docker inspect -f '{{.State.ExitCode}}' "$STOP_NAME" 2>/dev/null)）"
+  kiln_show_failure_log "$STOP_NAME"
+fi
+docker rm -fv "$STOP_NAME" >/dev/null 2>&1
 
 echo
 [ "$FAIL" -eq 0 ] && echo "验收通过" || { echo "验收失败"; exit 1; }

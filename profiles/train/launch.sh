@@ -28,12 +28,14 @@ if [ -f "$REQ_LIST" ]; then
   fi
 fi
 
+. /app/.kiln/runtime_env.sh
+
 # 产物目录必须可写（checkpoint/日志往这里落）。挂宿主卷时属主要对得上容器内用户，
 # 否则非 root 写不进——这里只做明确报错，不强行 chown（非 root 无权改挂载卷属主）。
 mkdir -p "${OUTPUT_DIR}" 2>/dev/null || true
 if [ ! -w "${OUTPUT_DIR}" ]; then
   echo "[kiln] 产物目录不可写: ${OUTPUT_DIR}" >&2
-  echo "[kiln] 挂卷时请确保属主可被容器内用户(uid 10001)写入，例如先 chmod 777 宿主目录，或用具名卷。" >&2
+  echo "[kiln] 挂卷时请确保属主可被容器内用户(uid $(id -u))写入，例如先 chmod 777 宿主目录，或用具名卷。" >&2
   exit 1
 fi
 
@@ -47,11 +49,13 @@ if [ -n "${CONFIG_MATERIALIZE}" ]; then
 fi
 
 # 训练命令（渲染自 pack.conf 的 START_CMD），例如: python -m trainer.train --steps 50
-START_CMD="$(cat /app/.kiln/start_cmd.sh)"
+# 验收可以用 KILN_VERIFY_START_CMD 换成短任务（pack.conf 的 VERIFY_START_CMD），真实训练跑不完一次冒烟。
+START_CMD="${KILN_VERIFY_START_CMD:-$(cat /app/.kiln/start_cmd.sh)}"
 
-# 启动器自己会拉起 python：去掉 START_CMD 开头的 python/python3，把剩下的「-m 模块 ...」或「脚本 ...」交给它。
+# 启动器自己会拉起 python：去掉 START_CMD 开头的解释器（python、python3.11、/opt/conda/bin/python 等），
+# 把剩下的「-m 模块 ...」或「脚本 ...」交给它。
 strip_python() {
-  printf '%s\n' "${START_CMD}" | sed -E 's/^[[:space:]]*python3?[[:space:]]+//'
+  printf '%s\n' "${START_CMD}" | sed -E 's#^[[:space:]]*(/[^[:space:]]*/)?python[0-9.]*[[:space:]]+##'
 }
 
 # 启动器由项目在 requirements 里安装，没装时给出明确报错。
@@ -88,4 +92,10 @@ case "${LAUNCHER}" in
 esac
 
 echo "[kiln] 起训: ${RUN_CMD}"
-exec /bin/sh -c "${RUN_CMD}"
+# kiln_init 当 PID 1，被抢占或 docker stop 时作业才收得到 SIGTERM，有机会存 checkpoint。详见 kiln_init.py。
+KILN_PY="$(command -v python || command -v python3 || true)"
+if [ -z "${KILN_PY}" ]; then
+  echo "[kiln] 找不到 python，无法转发停止信号，docker stop 时作业可能被强杀。" >&2
+  exec /bin/sh -c "${RUN_CMD}"
+fi
+exec "${KILN_PY}" -I -S /app/.kiln/kiln_init.py /bin/sh -c "${RUN_CMD}"
